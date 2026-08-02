@@ -944,3 +944,37 @@ async def test_the_health_report_still_sees_the_dead_streams_days_later(
                for line in (tmp_path / "health" / "alerts.ndjson")
                .read_text(encoding="utf-8").splitlines() if line.strip()]
     assert reasons.count("silent_streams") == len(FOUR_DAYS)
+
+
+@pytest.mark.asyncio
+async def test_a_double_start_costs_the_contended_hour_not_the_venue(tmp_path: Path):
+    """A second `capture --venue binance` must not corrupt the first's files,
+    and must not take itself down either: contention is a `RawCaptureError`
+    over one hour's pair, so the hour is quarantined like any other damage to
+    it and every other stream keeps recording.
+    """
+    from capture.raw_writer import paths_for, read_pair
+
+    venue = BinanceVenue()
+    t05 = 1785648600_000_000_000
+    holder = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                           clock_ns=lambda: t05)
+    holder._writer_for("depth", "BTCUSDT").append(
+        '{"held":0}', t05, None, None)          # holds depth's hour 05 open
+
+    intruder = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                             clock_ns=lambda: t05)
+    await intruder.consume(_frames(
+        [_depth_frame("BTCUSDT", 1)] + [_trade_frame("ETHUSDT", i) for i in range(3)]))
+    holder.close()
+
+    assert intruder.stats()["unwritable"] == 1
+    assert intruder.stats()["written"] == 3, "a sibling stream was taken down too"
+
+    refusals = [e for e in read_all(tmp_path, "binance", "2026-08-02")
+                if e.kind == "unwritable_stream"]
+    assert [e.detail["error"] for e in refusals] == ["HourHeldByAnotherWriter"]
+
+    # The holder's hour is exactly what the holder wrote - no interleaving.
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    assert [p[0] for p in read_pair(raw, idx)] == ['{"held":0}']

@@ -149,6 +149,37 @@ class HourStillBeingWritten(RawCaptureError):
         )
 
 
+class HourHeldByAnotherWriter(RawCaptureError):
+    """Raised when a `RawWriter` is asked to open an hour another writer holds.
+
+    Two `capture --venue binance` processes both open the pair with "ab", both
+    resume `n` from the same count, and their zstd frames interleave at
+    arbitrary byte boundaries. That is corruption at the container level, not
+    mere misalignment: `reconcile_pair` cannot repair it, because nothing
+    identifies which bytes belong to which writer. The second process also
+    overwrites the first's `.writing` marker, so the first's hour then looks
+    idle to `reconcile_pair`. With no supervisor and manual restarts, a
+    double-start is the likely operator accident.
+
+    A `RawCaptureError` deliberately, so `VenueRecorder` quarantines the
+    contended hour and keeps recording everything else, and rotation re-arms it.
+    Making it fatal would turn a marker left by a pid that has since been reused
+    into total capture loss - refusing forever is its own outage.
+    """
+
+    def __init__(self, raw_path: Path, marker_path: Path, pid: int | None) -> None:
+        self.raw_path = raw_path
+        self.marker_path = marker_path
+        self.pid = pid
+        super().__init__(
+            f"Refusing to open {raw_path}: another writer is already recording "
+            f"into this hour (marker {marker_path}, pid {pid}). Two writers on "
+            f"one hour interleave zstd frames and produce an unrepairable file. "
+            f"Stop the other capture process, or delete the marker if you are "
+            f"certain no process holds the file."
+        )
+
+
 class HourFileNotAppendable(RawCaptureError):
     """Raised when a `RawWriter` is asked to resume into a damaged hour.
 
@@ -314,12 +345,104 @@ class RawWriter:
                     f"so an entry is missing from the middle")
         return len(raw_lines)
 
+    @staticmethod
+    def _claim_hour_or_refuse(raw_path: Path) -> Path | None:
+        """Take the `.writing` marker for this hour, or refuse the hour.
+
+        Returns the marker path, or None when the marker could not be placed at
+        all (see the ENOSPC note below). Raises `HourHeldByAnotherWriter` when a
+        live process already holds it.
+
+        `O_CREAT | O_EXCL` rather than "check then write": the check-then-write
+        form loses to two processes starting at the same instant, which is
+        precisely the double-start this guards against. The exclusive create is
+        the whole synchronisation - it is one atomic operation on every
+        filesystem this runs on.
+
+        A marker whose pid is gone was left by a crash. Refusing it forever
+        would be its own outage - a restart is exactly when capture must resume
+        - so it is cleared and the claim retried once. Retried ONCE, not looped:
+        if another writer wins the create in between, that writer is live and
+        the hour is genuinely held.
+
+        Residual risk, stated rather than hidden: the marker holds a pid and
+        nothing else, so a crashed writer whose pid has since been reused by an
+        unrelated process reads as live. The cost is bounded to that one hour -
+        `VenueRecorder` quarantines it and rotation re-arms - and the error
+        message names the marker so an operator can clear it.
+        """
+        marker = writing_marker_path(raw_path)
+        for attempt in (1, 2):
+            try:
+                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                is_live, _, pid = is_hour_being_written(raw_path)
+                if is_live or attempt == 2:
+                    raise HourHeldByAnotherWriter(raw_path, marker, pid) from None
+                marker.unlink(missing_ok=True)
+                continue
+            except OSError:
+                # The marker only guards reconcile_pair; failing to place it must
+                # not cost live frames, so the hour is opened without one.
+                #
+                # Be honest about what that costs: with no marker on disk,
+                # is_hour_being_written() reports this live hour as idle and
+                # reconcile_pair will repair it, swapping the index inode out
+                # from under the descriptor this writer still holds. Every index
+                # entry written afterwards lands in the orphaned inode and is
+                # lost. The post-repair appendability check in reconcile_pair
+                # does not prevent that - it runs before those entries are
+                # written, so it can only catch a writer that was already
+                # mid-hour, not one that keeps writing after the swap.
+                #
+                # This is accepted rather than fixed: refusing to open the hour
+                # would turn one unwritable sidecar into total capture loss for
+                # the stream, and the trigger (ENOSPC or a permission fault on a
+                # directory whose raw files are about to open successfully) is
+                # both rare and one that stops frames landing anyway.
+                return None
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(str(os.getpid()).encode("utf-8"))
+            except OSError:
+                # An empty or half-written marker parses as unreadable, which
+                # `is_hour_being_written` treats as LIVE - it would block repair
+                # of this hour forever. Better no marker than a permanent one.
+                marker.unlink(missing_ok=True)
+                return None
+            return marker
+        return None          # unreachable: both attempts return or raise
+
+    @staticmethod
+    def _release_claim(marker: Path | None) -> None:
+        """Give up a claim this writer took but never opened the hour with.
+
+        Its own live pid on the marker would make `reconcile_pair` refuse the
+        repair that is the documented way out of a refused open.
+        """
+        if marker is None:
+            return
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass          # a marker that cannot be removed is not worth losing the real error over
+
     def _open(self, hour: str) -> None:
         raw_path, idx_path = paths_for(self._root, self._venue, self._stream, self._symbol, hour)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
-        # Read the existing pair BEFORE opening anything for append: a damaged
-        # hour must be refused while nothing has been touched.
-        resume_n = self._count_frames_already_written(raw_path, idx_path)
+        # Claim the hour BEFORE reading the pair, and certainly before opening it
+        # for append: everything below assumes this process is the only writer,
+        # starting with the frame count `n` resumes from.
+        marker = self._claim_hour_or_refuse(raw_path)
+        try:
+            # Read the existing pair BEFORE opening anything for append: a damaged
+            # hour must be refused while nothing has been touched.
+            resume_n = self._count_frames_already_written(raw_path, idx_path)
+        except Exception:
+            # A refusal must not leave this process's own pid on the marker: it
+            # would block the `reconcile_pair` that is the documented way out.
+            self._release_claim(marker)
+            raise
 
         self._raw_fh = None
         self._idx_fh = None
@@ -348,30 +471,8 @@ class RawWriter:
                 raise
         except Exception:
             self._raw_fh = self._idx_fh = self._raw_z = self._idx_z = None
+            self._release_claim(marker)
             raise
-        marker = writing_marker_path(raw_path)
-        try:
-            marker.write_text(str(os.getpid()), encoding="utf-8")
-        except OSError:
-            # The marker only guards reconcile_pair; failing to place it must not
-            # cost live frames, so the hour is opened without one.
-            #
-            # Be honest about what that costs: with no marker on disk,
-            # is_hour_being_written() reports this live hour as idle and
-            # reconcile_pair will repair it, swapping the index inode out from
-            # under the descriptor this writer still holds. Every index entry
-            # written afterwards lands in the orphaned inode and is lost. The
-            # post-repair appendability check in reconcile_pair does not prevent
-            # that - it runs before those entries are written, so it can only
-            # catch a writer that was already mid-hour, not one that keeps
-            # writing after the swap.
-            #
-            # This is accepted rather than fixed: refusing to open the hour would
-            # turn one unwritable sidecar into total capture loss for the stream,
-            # and the trigger (ENOSPC or a permission fault on a directory whose
-            # raw files just opened successfully) is both rare and one that stops
-            # frames landing anyway.
-            marker = None
         self._marker_path = marker
         self._hour, self._n = hour, resume_n
         # The first frame of this open establishes the cadence reference; there

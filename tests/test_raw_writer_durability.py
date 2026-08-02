@@ -7,6 +7,7 @@ that orphaned the inode a live writer was still filling.
 """
 import builtins
 import errno
+import os
 import subprocess
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import zstandard
 from capture.raw_writer import (
     RawWriter, read_pair, reconcile_pair, paths_for, _read_lines,
     TruncatedFrameFile, HourStillBeingWritten, HourFileNotAppendable,
-    writing_marker_path,
+    HourHeldByAnotherWriter, writing_marker_path,
 )
 from capture.frame_codec import IndexEntry, encode_index_entry
 
@@ -859,3 +860,97 @@ def test_flush_never_leaves_the_index_ahead_of_the_raw_file(tmp_path: Path):
     assert not outcome.raw_was_salvaged, "the raw file was intact; nothing to salvage"
     assert [p[0] for p in read_pair(crash_raw, crash_idx)] == [
         f'{{"frame":{i}}}' for i in range(61)]
+
+
+# --------------------------------------------------------------------------
+# IMPORTANT 7 - two capture processes must not write the same hour
+# --------------------------------------------------------------------------
+
+def test_a_second_writer_refuses_an_hour_a_live_writer_holds(tmp_path: Path):
+    """The likely operator accident: `capture --venue binance` started twice.
+
+    `is_hour_being_written()` and the `.writing` marker already existed and
+    `reconcile_pair` consulted them, but `_open` did not. Both processes opened
+    the pair "ab", both resumed `n` from the same count, and their zstd frames
+    interleaved at arbitrary byte boundaries - corrupt at the container level,
+    not merely misaligned. Verified: `read_pair` came back
+    IndexPositionMismatch, and the second writer's `close()` silently deleted
+    the first's marker while the first was still recording.
+    """
+    holder = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    holder.append('{"held":0}', t_recv_ns=HOUR_05, t_exch_ms=None, seq=None)
+
+    intruder = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    with pytest.raises(HourHeldByAnotherWriter) as exc_info:
+        intruder.append('{"intruder":0}', t_recv_ns=HOUR_05 + 1, t_exch_ms=None, seq=None)
+    assert exc_info.value.pid == os.getpid()
+
+    # The refusal cost the holder nothing: its marker and its frames are intact.
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    assert writing_marker_path(raw).read_text(encoding="utf-8") == str(os.getpid())
+    holder.append('{"held":1}', t_recv_ns=HOUR_05 + 2, t_exch_ms=None, seq=None)
+    holder.close()
+    assert [p[0] for p in read_pair(raw, idx)] == ['{"held":0}', '{"held":1}']
+
+
+def test_the_refusal_is_isolated_to_the_contended_hour(tmp_path: Path):
+    """Contention over one hour's files is a `RawCaptureError` like any other
+    damage to them, so `VenueRecorder` quarantines that hour and keeps every
+    other stream recording - rather than taking the venue down."""
+    from capture.raw_writer import RawCaptureError
+
+    holder = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    holder.append('{"held":0}', t_recv_ns=HOUR_05, t_exch_ms=None, seq=None)
+
+    intruder = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    with pytest.raises(RawCaptureError):
+        intruder.append('{"x":0}', t_recv_ns=HOUR_05 + 1, t_exch_ms=None, seq=None)
+
+    # The next hour is a different pair of files and nobody holds it.
+    intruder.append('{"x":1}', t_recv_ns=HOUR_06, t_exch_ms=None, seq=None)
+    intruder.close()
+    holder.close()
+    r6, i6 = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T06")
+    assert [p[0] for p in read_pair(r6, i6)] == ['{"x":1}']
+
+
+def test_a_stale_marker_from_a_crashed_writer_does_not_block_recording(tmp_path: Path):
+    """Refusing forever would be its own outage. A crash leaves the marker
+    behind, and a restart is exactly when capture must resume - so a marker
+    whose pid is gone is cleared and claimed rather than obeyed."""
+    first = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    first.append('{"before":0}', t_recv_ns=HOUR_05, t_exch_ms=None, seq=None)
+    first.flush()
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    writing_marker_path(raw).write_text(str(dead.pid), encoding="utf-8")
+
+    second = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    second.append('{"after":0}', t_recv_ns=HOUR_05 + 1, t_exch_ms=None, seq=None)
+    assert writing_marker_path(raw).read_text(encoding="utf-8") == str(os.getpid())
+    second.close()
+
+    assert [p[0] for p in read_pair(raw, idx)] == ['{"before":0}', '{"after":0}']
+
+
+def test_a_refused_open_leaves_no_marker_of_its_own(tmp_path: Path):
+    """The claim is taken before the pair is read, so a damaged hour is refused
+    with the marker already placed. Leaving it behind would make the writer's
+    own live pid block the `reconcile_pair` that is the documented way out.
+    """
+    raw, idx = paths_for(tmp_path, "v", "s", "SYM", "2026-08-02T05")
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    _write_zst_lines(raw, ['{"frame":0}', '{"frame":1}'])
+    _write_zst_lines(idx, [encode_index_entry(IndexEntry(
+        n=0, t_recv_ns=HOUR_05, t_exch_ms=None, seq=None, kind="data", esc=False))])
+
+    w = RawWriter(tmp_path, "v", "s", "SYM")
+    with pytest.raises(HourFileNotAppendable):
+        w.append('{"frame":2}', t_recv_ns=HOUR_05 + 2, t_exch_ms=None, seq=None)
+
+    assert not writing_marker_path(raw).exists(), (
+        "the refused open left its own marker, which blocks the repair that "
+        "is the only way out of the refusal")
+    assert reconcile_pair(raw, idx).entries_rebuilt == 1
