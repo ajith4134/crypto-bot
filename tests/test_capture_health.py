@@ -112,6 +112,15 @@ def test_nothing_written_is_never_an_alert():
     assert classify_runway(compute_runway_days(1, 0)) == "ok"
 
 
+def test_a_nonsense_write_rate_is_refused_rather_than_called_ok():
+    """Both of these classify as "ok" if they are allowed through, and a
+    silently healthy answer is the failure this module exists to prevent."""
+    with pytest.raises(ValueError):
+        compute_runway_days(BIG, float("nan"))
+    with pytest.raises(ValueError):
+        compute_runway_days(BIG, -DAILY)
+
+
 # --- measured write rate ----------------------------------------------------
 
 def test_measure_daily_bytes_of_a_root_that_never_captured_is_zero(tmp_path: Path):
@@ -231,6 +240,22 @@ def test_damaged_ledger_lines_are_reported_and_alerted(tmp_path: Path):
     assert "ledger_damaged" in _reasons(tmp_path)
 
 
+def test_a_mistyped_severity_does_not_take_the_whole_report_down(tmp_path: Path):
+    """The line is valid JSON, so `read_all` returns it as an event. A report
+    that raises here leaves the venue-day unreported, which downstream cannot
+    tell apart from a healthy one."""
+    path = tmp_path / "ledger" / "binance" / DATE / "events.ndjson"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"ts_ns": TS, "venue": "binance", "stream": "depth",
+                                "kind": "gap", "severity": ["corrupting"],
+                                "detail": {}}) + "\n")
+
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+    assert report["events_total"] == 1
+    assert report["gaps"]["unknown"] == 1
+    assert report["gaps"]["corrupting"] == 0
+
+
 def test_corrupting_events_that_are_not_gaps_are_still_counted(tmp_path: Path):
     """`unwritable_stream_total` means a stream is being dropped entirely - the
     worst thing in the ledger, and not a gap."""
@@ -241,13 +266,14 @@ def test_corrupting_events_that_are_not_gaps_are_still_counted(tmp_path: Path):
                               SEVERITY_CORRUPTING, {}))
     ledger.record(LedgerEvent(TS, "binance", "trades", "malformed",
                               SEVERITY_INFO, {}))
+    ledger.record(LedgerEvent(TS, "binance", "book", "gap",
+                              SEVERITY_OBSERVATION_LOSS, {}))
     ledger.close()
 
     report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
-    assert report["gaps"]["corrupting"] == 1
-    assert report["gaps"]["info"] == 0
+    assert report["gaps"] == {"corrupting": 1, "observation_loss": 1, "info": 0}
     assert report["corrupting_non_gap"] == 1
-    assert report["events_total"] == 3
+    assert report["events_total"] == 4
     write_alerts(tmp_path, report)
     assert "corrupting_non_gap_events" in _reasons(tmp_path)
 
@@ -259,6 +285,17 @@ def test_a_healthy_report_writes_no_alert_file_at_all(tmp_path: Path):
     report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
     assert write_alerts(tmp_path, report) == 0
     assert not (tmp_path / "health" / "alerts.ndjson").exists()
+
+
+def test_the_worst_condition_is_the_first_line(tmp_path: Path):
+    """Whoever opens this file reads the top of it."""
+    ledger = CaptureLedger(tmp_path, "binance")
+    ledger.record(LedgerEvent(TS, "binance", "depth", "gap", SEVERITY_CORRUPTING, {}))
+    ledger.close()
+    report = build_report(tmp_path, "binance", DATE,
+                          free_bytes=4_000_000_000, daily_bytes=DAILY)
+    assert write_alerts(tmp_path, report) == 2
+    assert _reasons(tmp_path) == ["runway_decision_point", "corrupting_gaps"]
 
 
 def test_repeating_the_same_alert_does_not_repeat_the_line(tmp_path: Path):
@@ -341,6 +378,43 @@ def test_every_alert_carries_what_it_is_about(tmp_path: Path):
     assert alert["date"] == DATE
     assert alert["runway_days"] == 2.0
     assert alert["ts"].endswith("Z")
+
+
+def test_the_count_returned_is_what_reached_the_disk(tmp_path: Path):
+    """A batch where some alerts are new and some are repeats must report only
+    the new ones - a caller told '2' would believe two lines exist."""
+    report = build_report(tmp_path, "binance", DATE,
+                          free_bytes=4_000_000_000, daily_bytes=DAILY)
+    assert write_alerts(tmp_path, report) == 1                    # runway only
+
+    with_gaps = dict(report, gaps=dict(report["gaps"], corrupting=3))
+    assert write_alerts(tmp_path, with_gaps) == 1                 # runway repeats
+    assert _reasons(tmp_path) == ["runway_decision_point", "corrupting_gaps"]
+
+
+def test_an_alert_is_on_disk_before_it_is_reported_as_written(tmp_path: Path):
+    """The count is a promise that the line survives a power cut. A buffered
+    write that is lost would leave a caller believing it raised an alarm."""
+    import capture.capture_health as module
+
+    fsynced: list[str] = []
+    real_fsync = os.fsync
+
+    def trace_fsync(fd):
+        fsynced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        return real_fsync(fd)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module.os, "fsync", trace_fsync)
+    try:
+        report = build_report(tmp_path, "binance", DATE,
+                              free_bytes=4_000_000_000, daily_bytes=DAILY)
+        assert write_alerts(tmp_path, report) == 1
+    finally:
+        monkeypatch.undo()
+
+    assert str(tmp_path / "health" / "alerts.ndjson") in fsynced, \
+        "the alert was never fsynced"
 
 
 def test_alerts_are_appended_not_rewritten(tmp_path: Path):

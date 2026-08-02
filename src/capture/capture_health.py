@@ -35,6 +35,7 @@ import datetime as dt
 import json
 import os
 import time
+from math import isnan
 from pathlib import Path
 from stat import S_ISREG
 
@@ -55,8 +56,19 @@ _SECONDS_PER_DAY = 86400
 
 
 def compute_runway_days(free_bytes: int, daily_bytes: float) -> float:
-    """Days of disk left at the current write rate."""
-    if daily_bytes <= 0:
+    """Days of disk left at the current write rate.
+
+    A rate of zero is infinite runway - nothing is being written, which the
+    absence checks are responsible for, not this one. A negative or NaN rate is
+    refused instead: both would flow straight through `classify_runway` as
+    "ok", and a silent "ok" is the one answer this module must never invent.
+    """
+    if isnan(free_bytes) or isnan(daily_bytes):
+        raise ValueError(f"runway is undefined for free_bytes={free_bytes!r}, "
+                         f"daily_bytes={daily_bytes!r}")
+    if daily_bytes < 0:
+        raise ValueError(f"daily_bytes cannot be negative, got {daily_bytes!r}")
+    if daily_bytes == 0:
         return float("inf")
     return free_bytes / daily_bytes
 
@@ -192,9 +204,14 @@ def build_report(root: Path, venue: str, date: str,
     gaps = {"corrupting": 0, "observation_loss": 0, "info": 0}
     corrupting_non_gap = 0
     for event in events:
+        # A ledger line can be valid JSON and still carry a mistyped severity,
+        # which `read_all` has no reason to reject. Bucketing it keeps one odd
+        # line from raising and leaving the whole venue-day unreported - which
+        # is indistinguishable from healthy to anything downstream.
+        severity = event.severity if isinstance(event.severity, str) else "unknown"
         if event.kind == "gap":
-            gaps[event.severity] = gaps.get(event.severity, 0) + 1
-        elif event.severity == SEVERITY_CORRUPTING:
+            gaps[severity] = gaps.get(severity, 0) + 1
+        elif severity == SEVERITY_CORRUPTING:
             # `unwritable_stream_total` is the worst thing in the ledger - a
             # stream being dropped entirely - and it is not a gap.
             corrupting_non_gap += 1
@@ -330,6 +347,11 @@ def write_alerts(root: Path, report: dict) -> int:
     about one whose write failed. Records go down in a single fsynced write; if
     that write is interrupted the file may end mid-line, and the next call
     starts a fresh line rather than gluing a good record onto a torn one.
+
+    Dedup state lives in the file itself and is read, not locked, so two
+    processes reporting at the same instant can both decide an alert is new and
+    write it twice. That is the failure worth having: the alternative, a lock,
+    would let one stuck process stop the other from raising an alarm at all.
     """
     alerts = _build_alerts(report)
     if not alerts:
