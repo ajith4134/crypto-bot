@@ -1,11 +1,29 @@
+import time
 from pathlib import Path
 import pytest
 from capture.raw_writer import RawWriter, read_pair, hour_key, paths_for, PairLengthMismatch
 
 
-def test_hour_key_is_utc():
-    # 2026-08-02T05:30:00Z
-    assert hour_key(1785648600_000_000_000) == "2026-08-02T05"
+def test_hour_key_is_utc(monkeypatch):
+    """hour_key must read UTC, not the machine's local time.
+
+    Asserting only the UTC answer passes by accident on a box whose TZ is
+    already UTC - dropping `tz=timezone.utc` from hour_key survived the previous
+    version of this test for exactly that reason. The process timezone is moved
+    to a non-zero, non-integer offset so a naive fromtimestamp() gives a
+    different hour, and a different date at the boundary.
+    """
+    monkeypatch.setenv("TZ", "Asia/Kolkata")  # UTC+05:30, no DST
+    time.tzset()
+    try:
+        # 2026-08-02T05:30:00Z -> 11:00 local, so a naive read says hour 11.
+        assert hour_key(1785648600_000_000_000) == "2026-08-02T05"
+        # 2026-08-02T23:30:00Z -> 2026-08-03T05:00 local, so a naive read also
+        # lands on the wrong date.
+        assert hour_key(1785648600_000_000_000 + 64_800_000_000_000) == "2026-08-02T23"
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 def test_written_bytes_are_identical_to_input(tmp_path: Path):
@@ -146,44 +164,63 @@ def test_read_pair_exception_includes_counts_and_paths(tmp_path: Path):
     assert "reconcile_pair" in str(err).lower()  # Message should reference the repair function
 
 
-def test_append_increments_n_after_raw_write_not_idx_write(tmp_path: Path):
-    """Test for regression: n must be incremented after raw write even if idx write fails.
+def test_frame_after_a_failed_idx_write_keeps_its_own_receipt_time(tmp_path: Path):
+    """A mid-stream index write failure must not relabel later frames.
 
-    This ensures that if idx write fails after raw write succeeds, the next successful
-    append() will get a fresh n value and not reuse a duplicate sequence number.
+    This test replaces `test_append_increments_n_after_raw_write_not_idx_write`,
+    which asserted that `n` keeps incrementing so values are "not reused". That
+    assertion was true but hollow: nothing ever read `n`, so the guarantee it
+    claimed - that a frame is described by its own index entry - was not the one
+    being verified. Positional pairing meant frame 1's bytes came back carrying
+    frame 2's receipt time and sequence numbers. The n-increment behaviour is
+    kept and still asserted here, but what is actually verified is the property
+    it exists to provide.
     """
     from unittest.mock import MagicMock
+    from capture.raw_writer import reconcile_pair
 
+    base = 1785648600_000_000_000
     w = RawWriter(tmp_path, "test", "stream", "SYMBOL")
 
-    # First append succeeds normally
-    n0 = w.append('{"i":0}', t_recv_ns=1785648600_000_000_000, t_exch_ms=None, seq=None)
-    assert n0 == 0
+    assert w.append('{"frame":0}', t_recv_ns=base, t_exch_ms=None, seq={"id": 0}) == 0
     assert w._n == 1
 
-    # Save the original idx_z and replace it with a mock that fails on write
-    original_idx_z = w._idx_z
-
-    # Replace _idx_z with a mock that fails on any write call
-    mock_idx_z = MagicMock()
-    mock_idx_z.write.side_effect = IOError("Simulated idx write failure")
-    w._idx_z = mock_idx_z
-
-    # Second append fails at idx write but raw was already written
-    # After the failed write, w._n should be 2 (incremented after raw write)
+    # Frame 1: raw write lands, index write fails. The hole is now in the MIDDLE
+    # of the index, because frame 2 below writes its entry successfully.
+    surviving_idx_z = w._idx_z
+    failing_idx_z = MagicMock()
+    failing_idx_z.write.side_effect = IOError("Simulated idx write failure")
+    w._idx_z = failing_idx_z
     with pytest.raises(IOError):
-        w.append('{"i":1}', t_recv_ns=1785648600_000_000_001, t_exch_ms=None, seq=None)
+        w.append('{"frame":1}', t_recv_ns=base + 1, t_exch_ms=None, seq={"id": 1})
 
-    # Verify that n was incremented despite the idx write failure
-    # If n was NOT incremented, it would still be 1, and the next append would reuse it
-    assert w._n == 2, "n should be incremented after raw write, even if idx write fails"
+    # n advanced with the raw file, so frame 2 is labelled n=2 and frame 1's n=1
+    # is left unclaimed - that unclaimed value is how the hole is located.
+    assert w._n == 2, "n must track raw lines written, even when the idx write fails"
 
-    # Restore original idx_z for the next append
-    w._idx_z = original_idx_z
-
-    # Third append should get n=2 (not reuse n=1)
-    n2 = w.append('{"i":2}', t_recv_ns=1785648600_000_000_002, t_exch_ms=None, seq=None)
-    assert n2 == 2, "Should not reuse n after idx write failure"
-    assert w._n == 3
-
+    w._idx_z = surviving_idx_z
+    assert w.append('{"frame":2}', t_recv_ns=base + 2, t_exch_ms=None,
+                    seq={"id": 2}) == 2
     w.close()
+
+    raw, idx = paths_for(tmp_path, "test", "stream", "SYMBOL", "2026-08-02T05")
+
+    # 3 raw lines against 2 index entries: refused, not silently paired up.
+    with pytest.raises(PairLengthMismatch):
+        read_pair(raw, idx)
+
+    assert reconcile_pair(raw, idx) == 1
+
+    pairs = read_pair(raw, idx)
+    assert [p[0] for p in pairs] == ['{"frame":0}', '{"frame":1}', '{"frame":2}']
+    assert [p[1].n for p in pairs] == [0, 1, 2]
+
+    # Frame 1 lost its entry, so it must read as unknown - never as frame 2's.
+    assert pairs[1][1].kind == "recovered"
+    assert pairs[1][1].t_recv_ns == 0
+    assert pairs[1][1].seq is None
+
+    # Frame 2 keeps its own receipt time and sequence numbers.
+    assert pairs[2][1].kind == "data"
+    assert pairs[2][1].t_recv_ns == base + 2
+    assert pairs[2][1].seq == {"id": 2}
