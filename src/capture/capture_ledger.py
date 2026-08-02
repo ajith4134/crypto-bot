@@ -5,10 +5,11 @@ tiny compared to market data.
 """
 from __future__ import annotations
 
-import datetime as dt
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from capture.raw_writer import utc_date_of
 
 SEVERITY_INFO = "info"
 SEVERITY_OBSERVATION_LOSS = "observation_loss"
@@ -25,10 +26,6 @@ class LedgerEvent:
     detail: dict
 
 
-def _date_of(ts_ns: int) -> str:
-    return dt.datetime.fromtimestamp(ts_ns / 1e9, tz=dt.timezone.utc).strftime("%Y-%m-%d")
-
-
 def _path_for(root: Path, venue: str, date: str) -> Path:
     return Path(root) / "ledger" / venue / date / "events.ndjson"
 
@@ -40,7 +37,7 @@ class CaptureLedger:
         self._date: str | None = None
 
     def record(self, event: LedgerEvent) -> None:
-        date = _date_of(event.ts_ns)
+        date = utc_date_of(event.ts_ns)
         if date != self._date:
             self.close()
             path = _path_for(self._root, self._venue, date)

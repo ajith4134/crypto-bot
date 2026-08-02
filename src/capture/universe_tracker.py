@@ -12,12 +12,13 @@ should be recorded in the capture ledger.
 """
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from capture.raw_writer import utc_date_of
 
 KIND_LISTED = "listed"
 KIND_DELISTED = "delisted"
@@ -58,10 +59,6 @@ class UniverseEvent:
     detail: dict
 
 
-def _date_of(ts_ns: int) -> str:
-    return dt.datetime.fromtimestamp(ts_ns / 1e9, tz=dt.timezone.utc).strftime("%Y-%m-%d")
-
-
 def diff_universe(previous: list[str], current: list[str],
                   venue: str, ts_ns: int) -> list[UniverseEvent]:
     before, after = set(previous), set(current)
@@ -99,7 +96,7 @@ class UniverseTracker:
         self._max_delisted_fraction = max_delisted_fraction
 
     def _dir_for(self, ts_ns: int) -> Path:
-        return self._root / "universe" / self._venue / _date_of(ts_ns)
+        return self._root / "universe" / self._venue / utc_date_of(ts_ns)
 
     def _state_path(self) -> Path:
         return self._root / "universe" / self._venue / "last_snapshot.json"

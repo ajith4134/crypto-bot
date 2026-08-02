@@ -140,3 +140,23 @@ def test_midnight_rollover_routes_to_correct_date(tmp_path: Path):
     assert len(events_aug_3) == 1
     assert events_aug_2[0].kind == "late"
     assert events_aug_3[0].kind == "early"
+
+
+def test_the_last_nanosecond_of_a_day_is_filed_under_that_day(tmp_path: Path):
+    """`ts_ns / 1e9` rounds, and the rounding crosses midnight.
+
+    A present-day nanosecond timestamp is ~1.8e18, far past 2^53 where a float
+    stops holding every integer. One nanosecond before UTC midnight divides to
+    exactly midnight, so the event was filed under the NEXT day - and a health
+    report for the day it belongs to never sees it.
+    """
+    ts_last_ns_of_aug_2 = 1785715199_999_999_999      # 2026-08-02T23:59:59.999999999Z
+
+    ledger = CaptureLedger(tmp_path, "kraken")
+    ledger.record(LedgerEvent(
+        ts_ns=ts_last_ns_of_aug_2, venue="kraken", stream="trades",
+        kind="last_nanosecond", severity=SEVERITY_OBSERVATION_LOSS, detail={}))
+    ledger.close()
+
+    assert [e.kind for e in read_all(tmp_path, "kraken", "2026-08-02")] == ["last_nanosecond"]
+    assert read_all(tmp_path, "kraken", "2026-08-03") == []

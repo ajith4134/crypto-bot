@@ -401,3 +401,21 @@ def test_a_non_integer_timestamp_cannot_poison_the_state_file(tmp_path: Path):
     with pytest.raises(TypeError):
         tracker.record_snapshot(["BTCUSDT"], TS / 1e9)
     assert not (tmp_path / "universe" / "binance" / "last_snapshot.json").exists()
+
+
+def test_the_last_nanosecond_of_a_day_is_filed_under_that_day(tmp_path: Path):
+    """The universe record is permanent, so a wrong date in it is permanent too.
+
+    `ts_ns / 1e9` rounds: a present-day nanosecond timestamp is ~1.8e18, far past
+    the 2^53 a float can hold exactly, so one nanosecond before UTC midnight
+    divides to exactly midnight and the snapshot was filed under the NEXT day.
+    A backtest reading membership by date then sees the change a day early -
+    which is lookahead, the single thing this module exists to prevent.
+    """
+    ts_last_ns_of_aug_2 = 1785715199_999_999_999      # 2026-08-02T23:59:59.999999999Z
+
+    tracker = UniverseTracker(tmp_path, "binance")
+    tracker.record_snapshot(["BTCUSDT", "ETHUSDT"], ts_last_ns_of_aug_2)
+
+    assert _instruments_path(tmp_path, date="2026-08-02").exists()
+    assert not _instruments_path(tmp_path, date="2026-08-03").exists()

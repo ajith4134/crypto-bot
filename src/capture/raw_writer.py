@@ -168,9 +168,37 @@ class HourFileNotAppendable(RawCaptureError):
         )
 
 
+def _utc_moment(ts_ns: int) -> dt.datetime:
+    """The UTC instant a nanosecond timestamp names.
+
+    Integer division, never `ts_ns / 1e9`. A present-day nanosecond timestamp is
+    ~1.8e18, well past the 2^53 (~9.0e15) where a float stops being able to hold
+    every integer, so the division rounds. A timestamp one nanosecond before UTC
+    midnight rounds UP to the next second and is filed under the WRONG CALENDAR
+    DAY. Verified 2026-08-02: `1785715199_999_999_999` (2026-08-02T23:59:59.999...)
+    came back as 2026-08-03.
+
+    Every ns -> calendar conversion in this project goes through here for that
+    reason. `capture_ledger` and `universe_tracker` each carried their own copy
+    in the float form and each had the bug; the universe record is permanent, so
+    a wrong date written into it cannot be corrected later.
+    """
+    return dt.datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=dt.timezone.utc)
+
+
 def hour_key(ts_ns: int) -> str:
-    moment = dt.datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=dt.timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H")
+    """The UTC hour a nanosecond timestamp falls in, as `YYYY-MM-DDTHH`."""
+    return _utc_moment(ts_ns).strftime("%Y-%m-%dT%H")
+
+
+def utc_date_of(ts_ns: int) -> str:
+    """The UTC calendar day a nanosecond timestamp falls on, as `YYYY-MM-DD`.
+
+    Kept beside `hour_key` deliberately: they are the same conversion at two
+    granularities, and holding them in separate modules is how two of the three
+    copies came to round the wrong way.
+    """
+    return _utc_moment(ts_ns).strftime("%Y-%m-%d")
 
 
 def paths_for(root: Path, venue: str, stream: str, symbol: str, hour: str) -> tuple[Path, Path]:
