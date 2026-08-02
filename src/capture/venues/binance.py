@@ -61,7 +61,12 @@ class BinanceVenue:
 
         symbol = body.get("s")
         if not isinstance(symbol, str) or not symbol:
-            symbol = "unknown"
+            # Not every event puts the symbol at top level - forceOrder nests
+            # order fields under "o". Fall back there before giving up.
+            nested = body.get("o")
+            symbol = nested.get("s") if isinstance(nested, dict) else None
+            if not isinstance(symbol, str) or not symbol:
+                symbol = "unknown"
 
         stream = _EVENT_TO_STREAM.get(event, event)
         return ExtractedMeta(t_exch_ms, seq, "data", stream, symbol)

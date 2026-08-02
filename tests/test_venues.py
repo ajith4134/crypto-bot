@@ -77,6 +77,22 @@ def test_binance_extract_does_not_raise_on_non_dict_frame():
         assert meta.kind == "control"
 
 
+def test_binance_extract_reads_top_level_symbol_when_present():
+    v = BinanceVenue()
+    meta = v.extract({"e": "aggTrade", "E": 1785650606302, "s": "ETHUSDT"})
+    assert meta.symbol == "ETHUSDT"
+
+
+def test_binance_extract_falls_back_to_nested_order_symbol_for_force_order():
+    v = BinanceVenue()
+    parsed = {"e": "forceOrder", "E": 1785650606302,
+              "o": {"s": "BTCUSDT", "S": "SELL", "q": "1.000"}}
+    meta = v.extract(parsed)
+    assert meta.symbol == "BTCUSDT"
+    assert meta.kind == "data"
+    assert meta.stream == "forceOrder"
+
+
 def test_binance_extract_depth_update_missing_chain_fields_has_no_seq():
     v = BinanceVenue()
     meta = v.extract({"e": "depthUpdate", "E": 1, "s": "BTCUSDT"})
