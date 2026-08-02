@@ -112,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--symbols must name at least one symbol")
     if args.seconds < 0:
         parser.error("--seconds cannot be negative (0 means run until interrupted)")
+    if args.silence_grace_seconds < 0:
+        # A negative grace makes every threshold collapse, so every stream is
+        # reported silent on its first check - an alert flood from a typo.
+        parser.error("--silence-grace-seconds cannot be negative")
 
     venue = _VENUES[args.venue]()
     specs = venue.core_specs(symbols)

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from capture.venue_recorder import VenueRecorder
+from capture.sequencing import StalenessTracker
 from capture.venues.binance import BinanceVenue
 from capture.capture_ledger import (
     read_all, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO,
@@ -480,6 +481,9 @@ async def test_a_healthy_bursty_trade_stream_does_not_alarm(tmp_path: Path):
         json.dumps({"data": {"e": "trade", "E": i, "s": "BTCUSDT", "t": i}})
         for i in range(len(gaps_ns))]))
 
+    # Without this the test is vacuous: a stream with no tracker at all raises
+    # no alarms either, and an upper bound alone cannot tell the two apart.
+    assert isinstance(rec._trackers[("trade", "btcusdt")], StalenessTracker)
     assert [e for e in silent_stream_events(tmp_path) if e.stream == "trade"] == []
     trade_gaps = [e for e in gap_events(tmp_path) if e.stream == "trade"]
     assert len(trade_gaps) <= len(gaps_ns) * 0.05, (
@@ -574,3 +578,106 @@ async def test_a_quarantined_stream_is_not_also_reported_dead(tmp_path: Path):
 
     assert second.stats()["unwritable"] == 30
     assert [e for e in silent_stream_events(tmp_path) if e.stream == "depth"] == []
+
+
+def ticks_from_gaps(start_ns: int, gaps_seconds: list[float],
+                    trailing_silence_seconds: float) -> list[int]:
+    """Clock reads for a session: construction, one per frame, one at close."""
+    ticks = [start_ns, start_ns]
+    for gap in gaps_seconds:
+        ticks.append(ticks[-1] + int(gap * 1e9))
+    ticks.append(ticks[-1] + int(trailing_silence_seconds * 1e9))
+    return ticks
+
+
+def trade_frames(count: int) -> list[str]:
+    return [json.dumps({"data": {"e": "trade", "E": i, "s": "BTCUSDT", "t": i}})
+            for i in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_a_stall_does_not_teach_the_silence_threshold(tmp_path: Path):
+    """The stall poisoning bug again, in the silence threshold this time.
+
+    A settled 1s stream takes one genuine 600s stall and then dies for good.
+    Folding that stall into the estimator made the threshold 1800s, so five
+    minutes of true silence - five times the grace - reported nothing. The
+    estimator has to describe what the stream routinely does, not what it did
+    on its worst frame.
+    """
+    venue = BinanceVenue()
+    gaps = [1.0] * 29 + [600.0]
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=iter(ticks_from_gaps(1785648600_000_000_000,
+                                                      gaps, 300.0)).__next__)
+
+    await rec.consume(_frames(trade_frames(len(gaps) + 1)))
+
+    dead = [e for e in silent_stream_events(tmp_path) if e.stream == "trade"]
+    assert len(dead) == 1, "a settled stream that died was not reported"
+    assert dead[0].detail["threshold_seconds"] == 60.0     # the stall taught nothing
+    assert dead[0].detail["silent_for_seconds"] == 300.0
+    assert dead[0].detail["frames_received"] == 31
+    # the stall itself is still reported as a gap
+    assert len([e for e in gap_events(tmp_path) if e.stream == "trade"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_routinely_slow_stream_still_learns_its_own_cadence(tmp_path: Path):
+    """The case that rules out simply excluding flagged gaps: a stream whose
+    every gap is 200s would have every one of them excluded as a stall and
+    would then be reported dead on a 60s grace, every session. A stall is a
+    one-off; a slow cadence repeats, and a quantile is what tells them apart."""
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=iter(ticks_from_gaps(1785648600_000_000_000,
+                                                      [200.0] * 5, 100.0)).__next__)
+
+    await rec.consume(_frames(trade_frames(6)))
+
+    assert [e for e in silent_stream_events(tmp_path) if e.stream == "trade"] == []
+
+
+@pytest.mark.asyncio
+async def test_silence_is_reported_within_a_bounded_time_however_slow_the_stream(
+        tmp_path: Path):
+    """However long a stream's history says it may sleep, silence has to be
+    reportable eventually - otherwise a stream can talk its way into never
+    being checked again."""
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=iter(ticks_from_gaps(1785648600_000_000_000,
+                                                      [3000.0] * 5, 4000.0)).__next__)
+
+    await rec.consume(_frames(trade_frames(6)))
+
+    dead = [e for e in silent_stream_events(tmp_path) if e.stream == "trade"]
+    assert len(dead) == 1
+    assert dead[0].detail["threshold_seconds"] == 3600.0        # the ceiling
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_speeds_up_is_judged_on_its_recent_cadence(tmp_path: Path):
+    """Why the gap window is bounded rather than a running history.
+
+    A quantile alone already outvotes a one-off stall, so a single old outlier
+    proves nothing about the window. What the window is for is a stream that
+    changes regime: 250 frames at 100s apart and then 200 at 1s apart is a
+    stream now capable of being judged in seconds, and an unbounded history
+    keeps it judged in minutes long after that stopped being true.
+    """
+    venue = BinanceVenue()
+    gaps = [100.0] * 250 + [1.0] * 200
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=iter(ticks_from_gaps(1785648600_000_000_000,
+                                                      gaps, 61.0)).__next__)
+
+    await rec.consume(_frames(trade_frames(len(gaps) + 1)))
+
+    dead = [e for e in silent_stream_events(tmp_path) if e.stream == "trade"]
+    assert len(dead) == 1, "judged on a cadence the stream has long outgrown"
+    assert dead[0].detail["threshold_seconds"] == 60.0

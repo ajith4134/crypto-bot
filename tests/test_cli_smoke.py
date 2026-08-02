@@ -436,6 +436,18 @@ def test_main_refuses_a_negative_duration(tmp_path: Path, monkeypatch):
     assert exit_info.value.code == 2
 
 
+def test_main_refuses_a_negative_silence_grace(tmp_path: Path, monkeypatch):
+    """A negative grace collapses the threshold and reports every stream silent
+    on its first check - the alert flood, from a typo."""
+    record_run_capture_calls(monkeypatch)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--venue", "binance", "--symbols", "BTCUSDT", "--root", str(tmp_path),
+              "--silence-grace-seconds", "-1"])
+
+    assert exit_info.value.code == 2
+
+
 def test_main_exits_on_interrupt_without_a_traceback(tmp_path: Path, monkeypatch):
     """Ctrl-C is how the run-until-interrupted mode is meant to end. asyncio
     cancels the capture (flushing it) and re-raises KeyboardInterrupt here."""

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -16,7 +17,7 @@ from capture.capture_ledger import (
     SEVERITY_OBSERVATION_LOSS,
 )
 from capture.raw_writer import RawCaptureError, RawWriter
-from capture.sequencing import BinanceDepthTracker, StalenessTracker
+from capture.sequencing import BinanceDepthTracker, StalenessTracker, quantile_ns
 
 # stream/symbol come from `extract()`, which reads them out of the wire
 # payload (event name, "s"/"coin" fields, ...). They end up as filename
@@ -27,10 +28,32 @@ from capture.sequencing import BinanceDepthTracker, StalenessTracker
 # already used for frames whose routing fields could not be determined.
 _SAFE_PATH_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
-# How many times its own widest observed gap a stream may go quiet before the
-# silence is reported. The same multiple `StalenessTracker` uses to tell an
-# outage from ordinary slowness, for the same reason.
+# How long a stream may go quiet before the silence is reported, as a function
+# of what that stream routinely does.
+#
+# The estimator is a quantile over a bounded window of recent gaps, and both
+# properties are load-bearing. A high-water mark was tried first and is the
+# same self-reinforcing failure `StalenessTracker` documents: one genuine 600s
+# stall on a settled 1s stream raised the threshold to 1800s, so the stream
+# could then die for good and five minutes of true silence reported nothing -
+# the stall taught the check that was meant to catch it.
+#
+# Excluding gaps that were themselves flagged as stalls does not work here,
+# which is why this is a quantile instead. On first sight a 200s gap on a 200s
+# stream is indistinguishable from a 200s stall on a 1s stream, so exclusion
+# throws away exactly the evidence a slow stream needs and then reports it dead
+# every session (test_a_routinely_slow_stream_still_learns_its_own_cadence).
+# What actually separates them is repetition: a stall is one-off and sits above
+# the quantile, a slow cadence repeats and becomes the quantile.
 _SILENCE_STALL_MULTIPLE = 3.0
+_SILENCE_CADENCE_QUANTILE = 0.90
+# Frames, matching `StalenessTracker`'s window for the same reason: an old
+# outlier has to age out rather than bind the threshold for the whole session.
+_SILENCE_WINDOW_FRAMES = 200
+# However slow a stream claims to be, silence becomes reportable eventually -
+# an hour, one file rotation. Without it a stream can talk its way into never
+# being checked again, and detection has to be bounded regardless of history.
+_SILENCE_CEILING_SECONDS = 3600.0
 
 
 def _safe_path_token(value: str) -> str:
@@ -62,12 +85,12 @@ class VenueRecorder:
         self._session_start_ns = clock_ns()
         self._silence_grace_ns = int(silence_grace_seconds * 1e9)
         # Per stream: when it last spoke, how many frames it has sent, and the
-        # widest gap it has shown - the evidence `_record_silent_streams` judges
-        # silence against. `_recorded_silent_streams` keeps that to one event
-        # per stream per session.
+        # its recent frame-to-frame gaps - the evidence `_silence_threshold_ns`
+        # judges silence against. `_recorded_silent_streams` keeps that to one
+        # event per stream per session.
         self._last_frame_ns: dict[tuple[str, str], int] = {}
         self._frames_seen: dict[tuple[str, str], int] = {}
-        self._widest_gap_ns: dict[tuple[str, str], int] = {}
+        self._recent_gaps_ns: dict[tuple[str, str], deque[int]] = {}
         self._recorded_silent_streams: set[tuple[str, str]] = set()
         self._writers: dict[tuple[str, str], RawWriter] = {}
         self._trackers: dict[tuple[str, str], object] = {}
@@ -173,20 +196,37 @@ class VenueRecorder:
     def _note_stream_spoke(self, key: tuple[str, str], t_recv_ns: int) -> None:
         """Remember that this stream is alive, and how far apart its frames come.
 
-        The widest gap is what `_record_silent_streams` judges silence against,
-        and it is kept here rather than taken from a `StalenessTracker` because
-        that tracker cannot supply it for the streams that need it most: a
-        stream whose ordinary cadence exceeds `stall_multiple` x its floor never
-        learns a baseline at all, so its threshold stays pinned at a few seconds
-        forever (see the learning-rule note in `sequencing.StalenessTracker`).
-        Judging a liquidation feed by that would report it dead every session.
+        The gap window is kept here rather than taken from a `StalenessTracker`
+        because that tracker cannot supply it for the streams that need it most:
+        a stream whose ordinary cadence exceeds `stall_multiple` x its floor
+        never learns a baseline at all, so its threshold stays pinned at a few
+        seconds forever (see the learning-rule note in
+        `sequencing.StalenessTracker`). Judging a liquidation feed by that would
+        report it dead every session.
+
+        Every gap is recorded, stalls included. They are not excluded but
+        outvoted - see the note on `_SILENCE_CADENCE_QUANTILE`.
         """
         last = self._last_frame_ns.get(key)
         if last is not None:
-            self._widest_gap_ns[key] = max(self._widest_gap_ns.get(key, 0),
-                                           t_recv_ns - last)
+            gaps = self._recent_gaps_ns.setdefault(
+                key, deque(maxlen=_SILENCE_WINDOW_FRAMES))
+            gaps.append(t_recv_ns - last)
         self._last_frame_ns[key] = t_recv_ns
         self._frames_seen[key] = self._frames_seen.get(key, 0) + 1
+
+    def _silence_threshold_ns(self, key: tuple[str, str]) -> int:
+        """How long this stream may be quiet before that is worth recording.
+
+        Never below the grace period - every stream is quiet at startup and a
+        stream that has said nothing has no cadence to be judged against - and
+        never above the ceiling, so death is always detected in bounded time.
+        """
+        gaps = self._recent_gaps_ns.get(key)
+        routine_ns = quantile_ns(sorted(gaps), _SILENCE_CADENCE_QUANTILE) if gaps else 0
+        return min(int(_SILENCE_CEILING_SECONDS * 1e9),
+                   max(self._silence_grace_ns,
+                       int(_SILENCE_STALL_MULTIPLE * routine_ns)))
 
     def _record_silent_streams(self, now_ns: int) -> None:
         """Record every subscribed stream that is not producing frames.
@@ -210,10 +250,11 @@ class VenueRecorder:
 
         How long is too long is per stream, and never shorter than the grace
         period. A stream that has shown its cadence is judged against
-        `_SILENCE_STALL_MULTIPLE` x the widest gap it has actually produced, so
-        a liquidation feed minutes between frames is not called dead while a
-        100ms depth stream is. A stream that has shown nothing (never spoke, or
-        spoke exactly once) has only the grace period to go on.
+        `_SILENCE_STALL_MULTIPLE` x a high quantile of its recent gaps, so a
+        liquidation feed minutes between frames is not called dead while a 100ms
+        depth stream is - and capped, so no history buys a stream permanent
+        exemption. A stream that has shown nothing (never spoke, or spoke
+        exactly once) has only the grace period to go on.
 
         Recorded at most once per stream per session: `consume` calls this as
         frames arrive and `close` calls it again, and an event per frame would
@@ -228,9 +269,11 @@ class VenueRecorder:
                 continue
             last_ns = self._last_frame_ns.get(key, self._session_start_ns)
             quiet_ns = now_ns - last_ns
-            threshold_ns = max(
-                self._silence_grace_ns,
-                int(_SILENCE_STALL_MULTIPLE * self._widest_gap_ns.get(key, 0)))
+            # The threshold is never below the grace, so a stream well inside it
+            # is settled without sorting its window - this runs on every frame.
+            if quiet_ns < self._silence_grace_ns:
+                continue
+            threshold_ns = self._silence_threshold_ns(key)
             if quiet_ns < threshold_ns:
                 continue
             self._recorded_silent_streams.add(key)

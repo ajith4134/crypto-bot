@@ -12,6 +12,16 @@ from dataclasses import dataclass
 from capture.capture_ledger import SEVERITY_CORRUPTING, SEVERITY_OBSERVATION_LOSS
 
 
+def quantile_ns(ordered: list[int], quantile: float) -> int:
+    """The value at `quantile` of an already-sorted list of gaps.
+
+    Shared with `VenueRecorder`, which needs the same "what does this stream
+    routinely do?" question answered about silence. One definition, so the two
+    answers cannot drift apart.
+    """
+    return ordered[min(int(len(ordered) * quantile), len(ordered) - 1)]
+
+
 @dataclass(frozen=True)
 class GapReport:
     severity: str
@@ -120,16 +130,12 @@ class StalenessTracker:
         self._gaps: deque[int] = deque(maxlen=window)
         self._last_ns: int | None = None
 
-    @staticmethod
-    def _quantile_ns(ordered: list[int], quantile: float) -> int:
-        return ordered[min(int(len(ordered) * quantile), len(ordered) - 1)]
-
     def _estimate_cadence_ns(self) -> int:
-        return self._quantile_ns(sorted(self._gaps), self._cadence_quantile)
+        return quantile_ns(sorted(self._gaps), self._cadence_quantile)
 
     def _estimate_routine_ceiling_ns(self) -> int:
         """The gap this stream does not routinely exceed, from the window itself."""
-        return self._quantile_ns(sorted(self._gaps), self._routine_ceiling_quantile)
+        return quantile_ns(sorted(self._gaps), self._routine_ceiling_quantile)
 
     def has_baseline(self) -> bool:
         return len(self._gaps) >= self._min_samples
@@ -142,8 +148,8 @@ class StalenessTracker:
         ordered = sorted(self._gaps)
         return max(
             self._floor_ns,
-            int(self._quantile_ns(ordered, self._cadence_quantile) * self._multiple),
-            self._quantile_ns(ordered, self._routine_ceiling_quantile),
+            int(quantile_ns(ordered, self._cadence_quantile) * self._multiple),
+            quantile_ns(ordered, self._routine_ceiling_quantile),
         )
 
     def check(self, t_recv_ns: int) -> GapReport | None:
