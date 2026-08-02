@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from capture.capture_ledger import (
-    CaptureLedger, LedgerEvent, SEVERITY_INFO,
+    CaptureLedger, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO,
 )
-from capture.raw_writer import RawWriter
+from capture.raw_writer import RawCaptureError, RawWriter
 from capture.sequencing import BinanceDepthTracker, HyperliquidStalenessTracker
 
 # stream/symbol come from `extract()`, which reads them out of the wire
@@ -48,7 +48,11 @@ class VenueRecorder:
         self._ledger = CaptureLedger(root, venue.name)
         self._writers: dict[tuple[str, str], RawWriter] = {}
         self._trackers: dict[tuple[str, str], object] = {}
-        self._stats = {"written": 0, "dropped": 0, "control": 0, "malformed": 0}
+        # Streams whose hour cannot be written, mapped to how many frames that
+        # has cost. See `_append_or_quarantine_stream`.
+        self._unwritable_streams: dict[tuple[str, str], int] = {}
+        self._stats = {"written": 0, "dropped": 0, "control": 0, "malformed": 0,
+                       "unwritable": 0}
 
     def _writer_for(self, stream: str, symbol: str) -> RawWriter:
         # Keyed on casefolded (stream, symbol) so the same logical stream reported
@@ -70,6 +74,66 @@ class VenueRecorder:
             else:
                 self._trackers[key] = None
         return self._trackers[key]
+
+    def _append_or_quarantine_stream(self, stream: str, symbol: str, payload: str,
+                                     t_recv_ns: int, t_exch_ms: int | None,
+                                     seq: dict | None, kind: str) -> None:
+        """Write one frame, isolating a stream whose hour cannot be written.
+
+        A damaged hour makes `RawWriter.append` raise `HourFileNotAppendable`
+        every time, for that one (stream, symbol). Letting it out of the loop
+        unwound `consume` entirely and took the venue down with it: on restart
+        the first frame killed the session, so an undamaged sibling stream in the
+        same session never even had a file created. A single torn hour became a
+        permanent crash loop across every stream of the venue - strictly worse
+        than the silent data loss the refusal replaced.
+
+        So the damage is contained to the stream that owns it. The stream is
+        quarantined on first failure rather than retried per frame: the condition
+        is persistent by construction, and retrying would put one ledger event
+        and one decompress of the damaged hour behind every frame that arrives.
+
+        Only `RawCaptureError` is isolated. It names damage to one hour's files,
+        which is inherently per-stream. Anything else - ENOSPC, a bad descriptor,
+        MemoryError - is a whole-recorder condition, and pretending it is
+        per-stream would spin instead of surfacing it.
+        """
+        key = (stream.casefold(), symbol.casefold())
+        if key in self._unwritable_streams:
+            self._unwritable_streams[key] += 1
+            self._stats["unwritable"] += 1
+            return
+        try:
+            self._writer_for(stream, symbol).append(
+                payload, t_recv_ns, t_exch_ms, seq, kind=kind)
+        except RawCaptureError as exc:
+            self._unwritable_streams[key] = 1
+            self._stats["unwritable"] += 1
+            self._ledger.record(LedgerEvent(
+                ts_ns=t_recv_ns, venue=self._venue.name, stream=stream,
+                kind="unwritable_stream", severity=SEVERITY_CORRUPTING,
+                detail={"symbol": symbol, "error": type(exc).__name__,
+                        "message": str(exc)},
+            ))
+            return
+        self._stats["written"] += 1
+
+    def _record_unwritable_stream_totals(self) -> None:
+        """Put each quarantined stream's frame count in the ledger, not just RAM.
+
+        The per-stream counter dies with the process; the ledger is the record an
+        incident is reconstructed from, so the size of the loss has to reach it.
+
+        Cleared as it is recorded, so a second `close()` - `consume` closes in a
+        `finally` and callers close explicitly - does not double-count.
+        """
+        recorded, self._unwritable_streams = self._unwritable_streams, {}
+        for (stream, symbol), lost in recorded.items():
+            self._ledger.record(LedgerEvent(
+                ts_ns=self._clock_ns(), venue=self._venue.name, stream=stream,
+                kind="unwritable_stream_total", severity=SEVERITY_CORRUPTING,
+                detail={"symbol": symbol, "frames_lost": lost},
+            ))
 
     def _record_gap(self, stream: str, symbol: str, report, t_recv_ns: int) -> None:
         self._ledger.record(LedgerEvent(
@@ -96,9 +160,9 @@ class VenueRecorder:
                         kind="malformed", severity=SEVERITY_INFO,
                         detail={"bytes": len(payload)},
                     ))
-                    self._writer_for("unknown", "unknown").append(
-                        payload, t_recv_ns, None, None, kind="malformed")
-                    self._stats["written"] += 1
+                    self._append_or_quarantine_stream(
+                        "unknown", "unknown", payload, t_recv_ns, None, None,
+                        kind="malformed")
                     continue
 
                 meta = self._venue.extract(parsed)
@@ -116,9 +180,9 @@ class VenueRecorder:
                     if report is not None:
                         self._record_gap(stream, symbol, report, t_recv_ns)
 
-                self._writer_for(stream, symbol).append(
-                    payload, t_recv_ns, meta.t_exch_ms, meta.seq, kind=meta.kind)
-                self._stats["written"] += 1
+                self._append_or_quarantine_stream(
+                    stream, symbol, payload, t_recv_ns, meta.t_exch_ms, meta.seq,
+                    kind=meta.kind)
         finally:
             self.close()
 
@@ -128,6 +192,10 @@ class VenueRecorder:
         # in front of consume() (a later, unwritten task) and can overflow. The
         # key and the zero-assertion are kept now, deliberately, so that task
         # only has to wire in the increment rather than invent the contract.
+        #
+        # `unwritable` is a different loss and deliberately a different key:
+        # frames that reached the recorder and could not be stored because their
+        # hour's files are damaged. It counts frames NOT in `written`.
         return dict(self._stats)
 
     def close(self) -> None:
@@ -137,6 +205,12 @@ class VenueRecorder:
         # Errors are collected and re-raised after every close was attempted,
         # rather than propagating from the first failure and abandoning the loop.
         errors: list[Exception] = []
+        # Before the ledger is closed, and inside the same error collection: a
+        # failure to record the totals must not cost the closes below.
+        try:
+            self._record_unwritable_stream_totals()
+        except Exception as exc:
+            errors.append(exc)
         for writer in self._writers.values():
             try:
                 writer.close()
