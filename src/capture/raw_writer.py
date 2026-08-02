@@ -104,8 +104,11 @@ class RawWriter:
         # neither file is affected. If idx write fails, raw has the frame but idx
         # doesn't; read_pair will detect and raise PairLengthMismatch.
         self._raw_z.write((escaped + "\n").encode("utf-8"))
-        self._idx_z.write((idx_line + "\n").encode("utf-8"))
+        # Increment n immediately after raw write succeeds. If idx write fails,
+        # self._n stays consistent with the number of raw lines written, so the
+        # next append() will get a fresh n value and not reuse a duplicate.
         self._n += 1
+        self._idx_z.write((idx_line + "\n").encode("utf-8"))
         return entry.n
 
     def flush(self) -> None:

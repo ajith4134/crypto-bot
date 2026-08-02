@@ -144,3 +144,46 @@ def test_read_pair_exception_includes_counts_and_paths(tmp_path: Path):
     assert err.raw_count == 3
     assert err.idx_count == 1
     assert "reconcile_pair" in str(err).lower()  # Message should reference the repair function
+
+
+def test_append_increments_n_after_raw_write_not_idx_write(tmp_path: Path):
+    """Test for regression: n must be incremented after raw write even if idx write fails.
+
+    This ensures that if idx write fails after raw write succeeds, the next successful
+    append() will get a fresh n value and not reuse a duplicate sequence number.
+    """
+    from unittest.mock import MagicMock
+
+    w = RawWriter(tmp_path, "test", "stream", "SYMBOL")
+
+    # First append succeeds normally
+    n0 = w.append('{"i":0}', t_recv_ns=1785648600_000_000_000, t_exch_ms=None, seq=None)
+    assert n0 == 0
+    assert w._n == 1
+
+    # Save the original idx_z and replace it with a mock that fails on write
+    original_idx_z = w._idx_z
+
+    # Replace _idx_z with a mock that fails on any write call
+    mock_idx_z = MagicMock()
+    mock_idx_z.write.side_effect = IOError("Simulated idx write failure")
+    w._idx_z = mock_idx_z
+
+    # Second append fails at idx write but raw was already written
+    # After the failed write, w._n should be 2 (incremented after raw write)
+    with pytest.raises(IOError):
+        w.append('{"i":1}', t_recv_ns=1785648600_000_000_001, t_exch_ms=None, seq=None)
+
+    # Verify that n was incremented despite the idx write failure
+    # If n was NOT incremented, it would still be 1, and the next append would reuse it
+    assert w._n == 2, "n should be incremented after raw write, even if idx write fails"
+
+    # Restore original idx_z for the next append
+    w._idx_z = original_idx_z
+
+    # Third append should get n=2 (not reuse n=1)
+    n2 = w.append('{"i":2}', t_recv_ns=1785648600_000_000_002, t_exch_ms=None, seq=None)
+    assert n2 == 2, "Should not reuse n after idx write failure"
+    assert w._n == 3
+
+    w.close()
