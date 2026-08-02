@@ -24,6 +24,13 @@ def test_binance_extract_reads_both_timestamps_and_chain():
     assert meta.symbol == "BTCUSDT"
 
 
+def test_binance_instruments_request_is_a_plain_get():
+    v = BinanceVenue()
+    assert v.instruments_request() == (
+        "GET", "https://fapi.binance.com/fapi/v1/exchangeInfo", None,
+    )
+
+
 def test_binance_parses_perp_instruments_only():
     v = BinanceVenue()
     payload = {"symbols": [
@@ -32,6 +39,13 @@ def test_binance_parses_perp_instruments_only():
         {"symbol": "OLDUSDT", "contractType": "PERPETUAL", "status": "BREAK"},
     ]}
     assert v.parse_instruments(payload) == ["BTCUSDT"]
+
+
+def test_hyperliquid_instruments_request_is_a_post_with_meta_body():
+    v = HyperliquidVenue()
+    assert v.instruments_request() == (
+        "POST", "https://api.hyperliquid.xyz/info", {"type": "meta"},
+    )
 
 
 def test_hyperliquid_subscribe_messages_cover_each_spec():

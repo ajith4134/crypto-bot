@@ -71,8 +71,8 @@ class BinanceVenue:
         stream = _EVENT_TO_STREAM.get(event, event)
         return ExtractedMeta(t_exch_ms, seq, "data", stream, symbol)
 
-    def instruments_url(self) -> str:
-        return _INSTRUMENTS_URL
+    def instruments_request(self) -> tuple[str, str, dict | None]:
+        return ("GET", _INSTRUMENTS_URL, None)
 
     def parse_instruments(self, payload: dict) -> list[str]:
         if not isinstance(payload, dict):

@@ -61,8 +61,8 @@ class HyperliquidVenue:
 
         return ExtractedMeta(t_exch_ms, None, "data", channel, symbol)
 
-    def instruments_url(self) -> str:
-        return _INSTRUMENTS_URL
+    def instruments_request(self) -> tuple[str, str, dict | None]:
+        return ("POST", _INSTRUMENTS_URL, {"type": "meta"})
 
     def parse_instruments(self, payload: dict) -> list[str]:
         if not isinstance(payload, dict):
