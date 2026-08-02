@@ -773,3 +773,89 @@ def test_a_failed_index_flush_drifts_only_in_the_repairable_direction(tmp_path: 
     resumed.append('{"after":1}', t_recv_ns=HOUR_05 + 500 * 10**9, t_exch_ms=None, seq=None)
     resumed.close()
     assert read_pair(raw, idx)[-1][0] == '{"after":1}'
+
+
+# --------------------------------------------------------------------------
+# IMPORTANT 5 - flush()'s ordering claim, constrained
+# --------------------------------------------------------------------------
+
+class _FailsTheSecondFlushOfAPair:
+    """Wraps a zstd stream writer and fails the SECOND flush of the pair.
+
+    Deliberately does not name a file. Which of the two files is flushed second
+    IS the property under test, so a test that patched `_idx_z` by name would
+    pass just as happily with the order reversed - which is exactly what the
+    existing `test_a_failed_index_flush_drifts_only_in_the_repairable_direction`
+    does, and why swapping `flush()` to index-first survived the whole suite.
+    """
+
+    def __init__(self, inner, calls: list[int]) -> None:
+        self._inner = inner
+        self._calls = calls
+
+    def flush(self, *args, **kwargs):
+        self._calls[0] += 1
+        if self._calls[0] == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return self._inner.flush(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_flush_never_leaves_the_index_ahead_of_the_raw_file(tmp_path: Path):
+    """Raw must gain its frame boundary before the index gains its own.
+
+    `reconcile_pair` rebuilds missing index entries from raw lines; nothing
+    rebuilds raw frames from index entries. So when the second of the two
+    flushes fails - ENOSPC is the realistic cause - the pair has to be left with
+    the index holding FEWER complete entries than the raw file holds frames.
+
+    Measured on this fixture: raw-first leaves raw=61 idx=31 and repairs to 61
+    frames kept. Index-first leaves raw=31 idx=61, and repair refuses with
+    UnrepairableIndex on a raw file that is completely intact - the frames are
+    not recoverable and an operator has an unrepairable hour.
+    """
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT", flush_interval_seconds=30.0)
+    _write_seconds_apart(w, 31)              # frame 30 emits a clean boundary in both
+
+    calls = [0]
+    real_raw_z, real_idx_z = w._raw_z, w._idx_z
+    w._raw_z = _FailsTheSecondFlushOfAPair(real_raw_z, calls)
+    w._idx_z = _FailsTheSecondFlushOfAPair(real_idx_z, calls)
+
+    with pytest.raises(OSError):
+        for i in range(31, 61):               # frame 60 triggers the failing boundary
+            w.append(f'{{"frame":{i}}}', t_recv_ns=HOUR_05 + i * 10**9,
+                     t_exch_ms=None, seq=None)
+    assert calls[0] == 2, "the fixture did not reach the second flush"
+
+    # The crash image: exactly the bytes that reached the OS before the failure.
+    # Whatever is still in a Python buffer is gone, which is what a crash means.
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    crash_raw, crash_idx = paths_for(tmp_path / "after_the_crash", "binance",
+                                     "depth", "BTCUSDT", "2026-08-02T05")
+    crash_raw.parent.mkdir(parents=True, exist_ok=True)
+    crash_raw.write_bytes(raw.read_bytes())
+    crash_idx.write_bytes(idx.read_bytes())
+
+    w._raw_z, w._idx_z = real_raw_z, real_idx_z         # let the live writer go
+    try:
+        w.close()
+    except OSError:
+        pass
+
+    raw_count = _count_lines_tolerantly(crash_raw)
+    idx_count = _count_lines_tolerantly(crash_idx)
+    assert idx_count <= raw_count, (
+        f"flush() left idx={idx_count} against raw={raw_count}: the one "
+        f"direction reconcile_pair cannot repair")
+    assert raw_count == 61, f"the raw file lost frames it had already taken: {raw_count}"
+
+    # And the drift it did leave is repairable, with every raw frame kept.
+    outcome = reconcile_pair(crash_raw, crash_idx)
+    assert outcome.raw_frames_kept == 61
+    assert outcome.entries_rebuilt == 61 - idx_count
+    assert not outcome.raw_was_salvaged, "the raw file was intact; nothing to salvage"
+    assert [p[0] for p in read_pair(crash_raw, crash_idx)] == [
+        f'{{"frame":{i}}}' for i in range(61)]
