@@ -223,15 +223,38 @@ class RawWriter:
     than destroy them. Each open starts a fresh zstd frame appended to the
     previous ones; concatenated frames read back as one stream (verified against
     zstandard 0.25.0).
+
+    A zstd frame boundary is also emitted every `flush_interval_seconds` of
+    stream time, and that cadence is what bounds crash loss. Nothing decodes from
+    a torn compressed block, so without periodic boundaries an hour written in
+    one open is a single block and one torn byte costs the entire hour. The
+    boundary is the only place the damage can stop. Measured on one hour of one
+    depth stream (36,000 frames, 19.7 MB raw):
+
+        cadence     size      vs none    worst-case loss
+        none        4.35 MB   -          19.66 MB (the whole hour)
+        ~100s       4.35 MB   -0.1%      0.55 MB
+        ~30s        4.43 MB   +1.8%      0.16 MB
+        ~10s        4.45 MB   +2.4%      0.05 MB
+
+    30s is the ruling: ~300 frames of worst-case loss for +1.8% storage.
+
+    The cadence is driven by each frame's own `t_recv_ns`, never by wall clock.
+    The writer is already driven by that timestamp for hour rotation, replay of a
+    recorded stream must produce byte-identical files, and a test must not have
+    to wait 30 real seconds to observe a boundary.
     """
 
-    def __init__(self, root: Path, venue: str, stream: str, symbol: str) -> None:
+    def __init__(self, root: Path, venue: str, stream: str, symbol: str,
+                 flush_interval_seconds: float = 30.0) -> None:
         self._root = Path(root)
         self._venue, self._stream, self._symbol = venue, stream, symbol
+        self._flush_interval_ns = int(flush_interval_seconds * 1e9)
         self._hour: str | None = None
         self._raw_fh = self._idx_fh = None
         self._raw_z = self._idx_z = None
         self._marker_path: Path | None = None
+        self._last_flush_ns: int | None = None
         self._n = 0
 
     @staticmethod
@@ -323,6 +346,9 @@ class RawWriter:
             marker = None
         self._marker_path = marker
         self._hour, self._n = hour, resume_n
+        # The first frame of this open establishes the cadence reference; there
+        # is no wall clock in this path by design.
+        self._last_flush_ns = None
 
     def append(self, payload: str, t_recv_ns: int, t_exch_ms: int | None,
                seq: dict | None, kind: str = "data") -> int:
@@ -347,11 +373,56 @@ class RawWriter:
         # by n and inserts the recovered entry at the right position.
         self._n += 1
         self._idx_z.write((idx_line + "\n").encode("utf-8"))
+        # After both lines are down, never between them: a boundary emitted
+        # mid-frame would put a raw line on one side of it and its index entry on
+        # the other, which is the mismatch every other ordering rule here exists
+        # to avoid.
+        self._flush_if_interval_elapsed(t_recv_ns)
         return entry.n
 
+    def _flush_if_interval_elapsed(self, t_recv_ns: int) -> None:
+        """Close the zstd frame once `flush_interval_seconds` of stream time passed.
+
+        The frame boundary is where crash damage stops, so this is what bounds
+        worst-case loss to the frames that arrived since the last one.
+
+        Measured against the frame's own timestamp rather than the wall clock:
+        replaying a recorded stream must produce byte-identical files, and a test
+        must not have to wait 30 real seconds to observe a boundary.
+
+        A timestamp that reaches backwards resets the reference without emitting
+        a boundary. Out-of-order frames are ordinary on a live socket, and
+        treating one as "the interval elapsed" would emit a frame per late
+        arrival - the cost of a wrong guess here is compression, so it is spent
+        on the side that does not fragment the file.
+        """
+        if self._raw_z is None:
+            return
+        if self._last_flush_ns is None or t_recv_ns < self._last_flush_ns:
+            self._last_flush_ns = t_recv_ns
+            return
+        if t_recv_ns - self._last_flush_ns >= self._flush_interval_ns:
+            self.flush()
+            self._last_flush_ns = t_recv_ns
+
     def flush(self) -> None:
-        # Raw is flushed to completion before the index gains its own frame, for
-        # the same reason close() finishes them in that order - see close().
+        """Emit a zstd frame boundary in both files, raw first.
+
+        Ordering is load-bearing for the same reason it is in `close()`:
+        `reconcile_pair` can rebuild missing index entries from raw lines, but
+        nothing can rebuild raw frames from index entries.
+
+        The two files can only drift apart in one way, and it is the harmless
+        one. If the raw flush succeeds and the index flush then fails - ENOSPC is
+        the realistic cause - the raw file has a boundary the index does not, so
+        a crash leaves the index holding FEWER complete entries than the raw file
+        holds frames. That is the direction `reconcile_pair` repairs: the missing
+        entries come back as kind="recovered". The reverse drift cannot happen,
+        because the index is never flushed before raw and an exception on the raw
+        side stops the sequence before the index is touched.
+        """
+        # Raw is flushed to completion before the index gains its own frame - see
+        # the docstring above and close().
         if self._raw_z is not None:
             self._raw_z.flush(zstandard.FLUSH_FRAME)
             self._raw_fh.flush()
@@ -405,6 +476,7 @@ class RawWriter:
         self._raw_z = self._idx_z = self._raw_fh = self._idx_fh = None
         self._marker_path = None
         self._hour = None
+        self._last_flush_ns = None
 
         if len(errors) == 1:
             raise errors[0]

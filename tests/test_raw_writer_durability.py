@@ -46,6 +46,30 @@ def _count_lines_tolerantly(path: Path) -> int:
     except TruncatedFrameFile as exc:
         return len(exc.recovered_lines)
 
+
+def _count_zstd_frames(path: Path) -> int:
+    """How many concatenated zstd frames the file holds.
+
+    Each one is a boundary crash damage can stop at, so this is the thing the
+    flush cadence is actually producing.
+    """
+    data = path.read_bytes()
+    decompressor = zstandard.ZstdDecompressor()
+    position = frames = 0
+    while position < len(data):
+        frame_reader = decompressor.decompressobj()
+        frame_reader.decompress(data[position:])
+        position += len(data) - position - len(frame_reader.unused_data)
+        frames += 1
+    return frames
+
+
+def _write_seconds_apart(writer: RawWriter, count: int, seconds: float = 1.0,
+                         start_ns: int = HOUR_05) -> None:
+    for i in range(count):
+        writer.append(f'{{"frame":{i}}}', t_recv_ns=start_ns + int(i * seconds * 1e9),
+                      t_exch_ms=None, seq=None)
+
 # --------------------------------------------------------------------------
 # CRITICAL 1 - opening an hour file must never truncate it
 # --------------------------------------------------------------------------
@@ -531,3 +555,221 @@ def test_reconcile_of_an_absent_hour_is_a_no_op(tmp_path: Path):
     raw.parent.mkdir(parents=True, exist_ok=True)
     outcome = reconcile_pair(raw, idx)
     assert not outcome and outcome.entries_rebuilt == 0
+
+
+# --------------------------------------------------------------------------
+# ROUND 3 - a periodic zstd frame boundary bounds crash loss to one interval
+# --------------------------------------------------------------------------
+
+def test_a_torn_hour_loses_only_the_frames_since_the_last_flush(tmp_path: Path):
+    """The whole point of the cadence, asserted as an explicit frame count.
+
+    Nothing decodes from a torn compressed block, so without periodic boundaries
+    an hour written in one open is a single block and one chopped byte costs
+    every frame in it - measured at 400/400 lost in round 2. A boundary every 30s
+    of stream time is the only place the damage can stop.
+    """
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT", flush_interval_seconds=30.0)
+    _write_seconds_apart(w, 100)                     # 1s cadence, 100 frames
+    w.close()
+
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    with pytest.raises(TruncatedFrameFile) as exc_info:
+        _read_lines(raw)
+    recovered = exc_info.value.recovered_lines
+    # Boundaries land after frames 30, 60 and 90, so 0-90 are on the safe side.
+    assert len(recovered) == 91, (
+        f"{len(recovered)} of 100 frames survived; without the cadence it is 0")
+    assert recovered == [f'{{"frame":{i}}}' for i in range(91)]
+
+
+def test_without_the_cadence_the_same_damage_costs_the_whole_hour(tmp_path: Path):
+    """The contrast that makes the previous test mean something."""
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT",
+                  flush_interval_seconds=10_000.0)     # effectively never
+    _write_seconds_apart(w, 100)
+    w.close()
+
+    raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    assert _count_zstd_frames(raw) == 1, "one open, one frame, one block"
+    _chop_last_byte(raw)
+
+    with pytest.raises(TruncatedFrameFile) as exc_info:
+        _read_lines(raw)
+    assert exc_info.value.recovered_lines == [], "a torn lone block yields nothing"
+
+
+@pytest.mark.parametrize("interval_seconds,cadence_seconds,count", [
+    (30.0, 1.0, 100),
+    (10.0, 1.0, 100),
+    (5.0, 1.0, 100),
+    (30.0, 0.1, 400),
+    (30.0, 8.0, 40),
+])
+def test_frames_at_risk_are_bounded_by_the_configured_interval(
+        tmp_path: Path, interval_seconds: float, cadence_seconds: float, count: int):
+    """Only frames since the last boundary are at risk, and the bound is the interval."""
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT",
+                  flush_interval_seconds=interval_seconds)
+    _write_seconds_apart(w, count, seconds=cadence_seconds)
+    w.close()
+
+    raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+    at_risk = count - _count_lines_tolerantly(raw)
+
+    # One interval's worth of arrivals, plus the frame that triggers the boundary.
+    bound = int(interval_seconds / cadence_seconds) + 1
+    assert at_risk <= bound, f"{at_risk} frames at risk against a bound of {bound}"
+
+
+def test_a_smaller_flush_interval_emits_more_frames(tmp_path: Path):
+    """The parameter is honoured, on synthetic timestamps rather than real time."""
+    counts = {}
+    for interval in (5.0, 10.0, 30.0):
+        root = tmp_path / f"interval_{interval}"
+        w = RawWriter(root, "binance", "depth", "BTCUSDT",
+                      flush_interval_seconds=interval)
+        _write_seconds_apart(w, 100)
+        w.close()
+        raw, _ = paths_for(root, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+        counts[interval] = _count_zstd_frames(raw)
+
+    # 100 frames at 1s: a boundary every `interval` seconds, plus the close.
+    assert counts == {5.0: 20, 10.0: 10, 30.0: 4}, counts
+
+
+def test_flush_keeps_raw_and_index_frame_aligned(tmp_path: Path):
+    """Both files get the boundary, so damage costs the same range in each."""
+    for interval in (5.0, 30.0):
+        root = tmp_path / f"interval_{interval}"
+        w = RawWriter(root, "binance", "depth", "BTCUSDT",
+                      flush_interval_seconds=interval)
+        _write_seconds_apart(w, 100)
+        w.close()
+        raw, idx = paths_for(root, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+        assert _count_zstd_frames(raw) == _count_zstd_frames(idx), interval
+        assert _count_lines_tolerantly(raw) == _count_lines_tolerantly(idx)
+
+
+def test_an_out_of_order_timestamp_does_not_emit_a_boundary(tmp_path: Path):
+    """Late arrivals are ordinary on a live socket; each must not cost a frame.
+
+    The cadence is measured against the frame's own timestamp, so a backward
+    jump resets the reference rather than reading as "the interval elapsed".
+    """
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT", flush_interval_seconds=30.0)
+    base = HOUR_05 + 600 * 10**9
+    for offset_seconds in (0, -5, -10, -3, -8, -1):     # all within the same hour
+        w.append(f'{{"late":{offset_seconds}}}',
+                 t_recv_ns=base + offset_seconds * 10**9, t_exch_ms=None, seq=None)
+    w.close()
+
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    assert _count_zstd_frames(raw) == 1, "a late frame emitted a boundary"
+    assert len(read_pair(raw, idx)) == 6
+
+
+def test_rotation_still_works_with_flushing_enabled(tmp_path: Path):
+    """The cadence must not disturb hour rotation, or resume across it."""
+    w = RawWriter(tmp_path, "hyperliquid", "l2Book", "BTC", flush_interval_seconds=5.0)
+    for i in range(60):
+        w.append(f'{{"h5":{i}}}', t_recv_ns=HOUR_05 + i * 10**9, t_exch_ms=None, seq=None)
+    for i in range(60):
+        w.append(f'{{"h6":{i}}}', t_recv_ns=HOUR_06 + i * 10**9, t_exch_ms=None, seq=None)
+    # One late frame reaches back over the boundary and re-opens hour 05.
+    w.append('{"h5":60}', t_recv_ns=HOUR_05 + 60 * 10**9, t_exch_ms=None, seq=None)
+    w.close()
+
+    r5, i5 = paths_for(tmp_path, "hyperliquid", "l2Book", "BTC", "2026-08-02T05")
+    r6, i6 = paths_for(tmp_path, "hyperliquid", "l2Book", "BTC", "2026-08-02T06")
+    hour_05 = read_pair(r5, i5)
+    assert [p[0] for p in hour_05] == [f'{{"h5":{i}}}' for i in range(61)]
+    assert [p[1].n for p in hour_05] == list(range(61))
+    assert [p[0] for p in read_pair(r6, i6)] == [f'{{"h6":{i}}}' for i in range(60)]
+    assert _count_zstd_frames(r5) > 1 and _count_zstd_frames(r6) > 1
+
+
+def test_repair_and_resume_still_terminate_with_flushing_enabled(tmp_path: Path):
+    """Round 2's cycle, now over a file the cadence has already split.
+
+    This is the combination that matters in production: the crash shape, the
+    boundary that bounds it, and the repair that has to make the hour appendable
+    again - and the salvage now keeps 91 frames where it kept 0.
+    """
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT", flush_interval_seconds=30.0)
+    _write_seconds_apart(w, 100)
+    w.close()
+
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    blocked = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    with pytest.raises(HourFileNotAppendable):
+        blocked.append('{"frame":100}', t_recv_ns=HOUR_05 + 100 * 10**9,
+                       t_exch_ms=None, seq=None)
+
+    outcome = reconcile_pair(raw, idx)
+    assert outcome.raw_was_salvaged
+    assert outcome.raw_frames_kept == 91, "the cadence is what makes 91 recoverable"
+    assert outcome.entries_discarded == 9
+
+    resumed = RawWriter(tmp_path, "binance", "depth", "BTCUSDT",
+                        flush_interval_seconds=30.0)
+    resumed.append('{"frame":100}', t_recv_ns=HOUR_05 + 100 * 10**9,
+                   t_exch_ms=None, seq=None)
+    resumed.close()
+
+    pairs = read_pair(raw, idx)
+    assert len(pairs) == 92
+    assert [p[1].n for p in pairs] == list(range(92))
+    assert [p[0] for p in pairs[:91]] == [f'{{"frame":{i}}}' for i in range(91)]
+    assert pairs[-1][0] == '{"frame":100}'
+    # The salvaged frames kept the metadata they already had.
+    assert [p[1].t_recv_ns for p in pairs[:91]] == [HOUR_05 + i * 10**9 for i in range(91)]
+
+
+def test_a_failed_index_flush_drifts_only_in_the_repairable_direction(tmp_path: Path):
+    """The one way the two files can fall out of frame alignment.
+
+    Raw is flushed first, so if the index flush then fails (ENOSPC is the
+    realistic cause) the raw file has a boundary the index does not, and a crash
+    leaves the index holding FEWER complete entries than the raw file holds
+    frames. That is the direction reconcile_pair repairs. The reverse cannot
+    happen: the index is never flushed before raw, and an exception on the raw
+    side stops the sequence before the index is touched.
+    """
+    from unittest.mock import MagicMock
+
+    w = RawWriter(tmp_path, "binance", "depth", "BTCUSDT", flush_interval_seconds=30.0)
+    _write_seconds_apart(w, 40)                  # one boundary already emitted
+
+    real_idx_z = w._idx_z
+    failing_idx_z = MagicMock(wraps=real_idx_z)
+    failing_idx_z.flush.side_effect = OSError(errno.ENOSPC, "No space left on device")
+    w._idx_z = failing_idx_z
+
+    with pytest.raises(OSError):
+        _write_seconds_apart(w, 100)             # the next boundary fails on the index
+    w._idx_z = real_idx_z                        # let close() finish normally
+
+    raw, idx = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    try:
+        w.close()
+    except OSError:
+        pass
+
+    raw_lines = _count_lines_tolerantly(raw)
+    idx_lines = _count_lines_tolerantly(idx)
+    assert idx_lines <= raw_lines, (
+        f"idx={idx_lines} against raw={raw_lines}: the one direction "
+        f"reconcile_pair cannot repair")
+
+    # And the pair is still repairable back to appendable.
+    outcome = reconcile_pair(raw, idx)
+    resumed = RawWriter(tmp_path, "binance", "depth", "BTCUSDT")
+    resumed.append('{"after":1}', t_recv_ns=HOUR_05 + 500 * 10**9, t_exch_ms=None, seq=None)
+    resumed.close()
+    assert read_pair(raw, idx)[-1][0] == '{"after":1}'
