@@ -17,7 +17,7 @@ from capture.capture_ledger import (
     CaptureLedger, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO,
     SEVERITY_OBSERVATION_LOSS,
 )
-from capture.raw_writer import RawCaptureError, RawWriter, hour_key
+from capture.raw_writer import RawCaptureError, RawWriter, hour_key, utc_date_of
 from capture.sequencing import BinanceDepthTracker, StalenessTracker, quantile_ns
 
 # stream/symbol come from `extract()`, which reads them out of the wire
@@ -100,14 +100,14 @@ class VenueRecorder:
         }
         self._session_start_ns = clock_ns()
         self._silence_grace_ns = int(silence_grace_seconds * 1e9)
-        # Per stream: when it last spoke, how many frames it has sent, and the
-        # its recent frame-to-frame gaps - the evidence `_silence_threshold_ns`
-        # judges silence against. `_recorded_silent_streams` keeps that to one
-        # event per stream per session.
+        # Per stream: when it last spoke, how many frames it has sent, and its
+        # recent frame-to-frame gaps - the evidence `_silence_threshold_ns`
+        # judges silence against. `_recorded_silent_days` keeps reporting to one
+        # event per stream per UTC day; the key carries the day for that reason.
         self._last_frame_ns: dict[tuple[str, str], int] = {}
         self._frames_seen: dict[tuple[str, str], int] = {}
         self._recent_gaps_ns: dict[tuple[str, str], deque[int]] = {}
-        self._recorded_silent_streams: set[tuple[str, str]] = set()
+        self._recorded_silent_days: set[tuple[tuple[str, str], str]] = set()
         self._writers: dict[tuple[str, str], RawWriter] = {}
         self._trackers: dict[tuple[str, str], object] = {}
         # (stream, symbol, hour) triples whose files cannot be written, and what
@@ -315,16 +315,32 @@ class VenueRecorder:
         exemption. A stream that has shown nothing (never spoke, or spoke
         exactly once) has only the grace period to go on.
 
-        Recorded at most once per stream per session: `consume` calls this as
-        frames arrive and `close` calls it again, and an event per frame would
-        drown the ledger in the anomaly it exists to surface. A stream that
-        recovers is deliberately not re-armed - it already had its incident.
+        Recorded at most once per stream per UTC DAY, and the day is what makes
+        this useful rather than merely quiet. `consume` calls this as frames
+        arrive and `close` calls it again, so an event per frame would drown the
+        ledger in the anomaly it exists to surface - but once per SESSION, which
+        this was, does not line up with anything that reads it. `build_report`
+        reports one UTC day, and a `--seconds 0` capture is one session for
+        weeks: a stream that died on day one left an event in day one's ledger
+        only, and every later day read back `silent_streams=0`. Verified over
+        four days with three of four streams dead - days two, three and four all
+        reported a clean venue.
+
+        The day is therefore both the dedup scope and the ledger partition the
+        event lands in, so the two cannot drift apart again. The cost is one
+        extra event per still-dead stream per day, which is the smallest signal
+        that can honestly say "this is still dead" to a reader who only ever
+        looks at one day.
+
+        A stream that recovers is not re-armed within its day - it already had
+        its incident - and is simply not silent on the days after.
 
         Severity is observation loss, not corruption: what was captured is
         intact, there is simply less of it than was asked for.
         """
+        day = utc_date_of(now_ns)
         for key, (stream, symbol) in self._expected_streams.items():
-            if key in self._recorded_silent_streams:
+            if (key, day) in self._recorded_silent_days:
                 continue
             last_ns = self._last_frame_ns.get(key, self._session_start_ns)
             quiet_ns = now_ns - last_ns
@@ -335,7 +351,7 @@ class VenueRecorder:
             threshold_ns = self._silence_threshold_ns(key)
             if quiet_ns < threshold_ns:
                 continue
-            self._recorded_silent_streams.add(key)
+            self._recorded_silent_days.add((key, day))
             self._ledger.record(LedgerEvent(
                 ts_ns=now_ns, venue=self._venue.name, stream=stream,
                 kind="silent_stream", severity=SEVERITY_OBSERVATION_LOSS,

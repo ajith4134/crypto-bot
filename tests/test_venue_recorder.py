@@ -838,3 +838,109 @@ async def test_closing_twice_does_not_double_count_a_quarantined_hour(tmp_path: 
               if e.kind == "unwritable_stream_total"]
     assert len(totals) == 1, f"{len(totals)} totals for one quarantined hour"
     assert totals[0].detail["frames_lost"] == 1
+
+
+# --------------------------------------------------------------------------
+# CRITICAL - silence detection and health reporting must share a scope
+# --------------------------------------------------------------------------
+
+def silent_streams_on(root: Path, date: str) -> list:
+    return [e for e in read_all(root, "binance", date) if e.kind == "silent_stream"]
+
+
+def a_four_day_session_with_three_dead_streams(root: Path):
+    """depth speaks every 6h for four UTC days; the other three never speak."""
+    venue = BinanceVenue()
+    start = 1785648600_000_000_000                      # 2026-08-02T05:30:00Z
+    ticks = [start + i * 6 * 3600 * 10**9 for i in range(16)]
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), root,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_from([ticks[0]] + ticks))
+    return rec, [_depth_frame("BTCUSDT", i) for i in range(len(ticks))]
+
+
+FOUR_DAYS = ["2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05"]
+
+
+@pytest.mark.asyncio
+async def test_a_stream_still_dead_the_next_day_is_reported_again(tmp_path: Path):
+    """The scope mismatch that produced a clean bill of health over dead streams.
+
+    Silence was recorded once per stream per SESSION; `build_report` reports one
+    UTC DAY. A `--seconds 0` capture is one session for weeks, so a stream that
+    died on day one left an event only in day one's ledger and every later day
+    read `silent_streams=0`. Verified over four days with three of four streams
+    dead: days two, three and four all reported healthy.
+
+    The two scopes are made to agree by re-arming the check each UTC day, which
+    is exactly the granularity the report reads at - one event per stream per
+    day, not one per frame.
+    """
+    rec, frames = a_four_day_session_with_three_dead_streams(tmp_path)
+    await rec.consume(_frames(frames))
+
+    for date in FOUR_DAYS:
+        assert {e.stream for e in silent_streams_on(tmp_path, date)} == {
+            "trade", "markPrice", "forceOrder"}, f"{date} reported a clean venue"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_stream_is_reported_once_a_day_not_once_a_frame(tmp_path: Path):
+    """Re-arming per day must not become re-arming per frame: an event per frame
+    drowns the ledger in the anomaly it exists to surface."""
+    rec, frames = a_four_day_session_with_three_dead_streams(tmp_path)
+    await rec.consume(_frames(frames))
+
+    for date in FOUR_DAYS:
+        assert len(silent_streams_on(tmp_path, date)) == 3, date
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_comes_back_is_not_reported_dead_the_next_day(
+        tmp_path: Path):
+    """Re-arming reports a stream that is STILL dead, not one that recovered."""
+    venue = BinanceVenue()
+    start = 1785648600_000_000_000                      # 2026-08-02T05:30:00Z
+    day = 86400 * 10**9
+    ticks = [start, start + 12 * 3600 * 10**9,          # day 1: depth only
+             start + day, start + day + 3600 * 10**9]   # day 2: trade speaks again
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_from([ticks[0]] + ticks))
+    await rec.consume(_frames([
+        _depth_frame("BTCUSDT", 0),
+        _depth_frame("BTCUSDT", 1),
+        _trade_frame("BTCUSDT", 2),
+        _trade_frame("BTCUSDT", 3),
+    ]))
+
+    assert "trade" in {e.stream for e in silent_streams_on(tmp_path, "2026-08-02")}
+    assert "trade" not in {e.stream for e in silent_streams_on(tmp_path, "2026-08-03")}
+
+
+@pytest.mark.asyncio
+async def test_the_health_report_still_sees_the_dead_streams_days_later(
+        tmp_path: Path):
+    """The end the operator actually reads. Verified before the fix: days two
+    through four reported `status=present silent_streams=0 names=[]` while three
+    of four streams had been dead since day one, and no alert was ever raised
+    for them again.
+    """
+    from capture.capture_health import build_report, write_alerts
+
+    rec, frames = a_four_day_session_with_three_dead_streams(tmp_path)
+    await rec.consume(_frames(frames))
+
+    for date in FOUR_DAYS:
+        report = build_report(tmp_path, "binance", date,
+                              free_bytes=10**12, daily_bytes=1.0)
+        assert report["silent_streams"] == 3, date
+        assert report["silent_stream_names"] == ["forceOrder", "markPrice", "trade"]
+        # Only depth wrote bytes, so the venue-day total alone says "present".
+        assert list(report["raw_bytes_by_stream"]) == ["depth_BTCUSDT"]
+        assert write_alerts(tmp_path, report) >= 1, f"{date} raised no alert"
+
+    reasons = [json.loads(line)["reason"]
+               for line in (tmp_path / "health" / "alerts.ndjson")
+               .read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert reasons.count("silent_streams") == len(FOUR_DAYS)

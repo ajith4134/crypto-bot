@@ -492,3 +492,53 @@ def test_ten_times_as_many_silent_streams_is_a_new_alert(tmp_path: Path):
     write_alerts(tmp_path, dict(report, silent_streams=12, silent_stream_names=["a"]))
 
     assert _reasons(tmp_path) == ["silent_streams", "silent_streams"]
+
+
+# --------------------------------------------------------------------------
+# CRITICAL - one live stream must not report presence on behalf of its siblings
+# --------------------------------------------------------------------------
+
+def test_raw_bytes_are_reported_per_stream_not_only_as_a_venue_total(tmp_path: Path):
+    """`raw_data_bytes` sums the whole venue-day folder, so one stream that is
+    still flowing makes the venue-day look present while every sibling is dead.
+    That is the archive-of-order-book-and-nothing-else failure, and the total
+    alone cannot show it. The per-stream breakdown can.
+    """
+    depth, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", f"{DATE}T00")
+    depth.parent.mkdir(parents=True, exist_ok=True)
+    depth.write_bytes(b"x" * 4_096)
+    trade, _ = paths_for(tmp_path, "binance", "trade", "BTCUSDT", f"{DATE}T00")
+    trade.write_bytes(b"y" * 512)
+
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+
+    assert report["raw_data_bytes"] == 4_608
+    assert report["raw_bytes_by_stream"] == {"depth_BTCUSDT": 4_096,
+                                             "trade_BTCUSDT": 512}
+
+
+def test_bytes_of_one_stream_are_summed_across_its_hours(tmp_path: Path):
+    for hour in ("00", "01", "02"):
+        raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", f"{DATE}T{hour}")
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"x" * 100)
+
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+    assert report["raw_bytes_by_stream"] == {"depth_BTCUSDT": 300}
+
+
+def test_a_stream_that_wrote_nothing_that_day_is_absent_from_the_breakdown(
+        tmp_path: Path):
+    """A stream with no bytes has no key, which is what makes the difference
+    between "quiet market" and "dead" answerable against the subscribed set."""
+    _write_capture_file(tmp_path, "binance", DATE, 4_096)
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+    assert list(report["raw_bytes_by_stream"]) == ["depth_BTCUSDT"]
+
+
+def test_a_writing_marker_is_not_counted_as_a_streams_bytes(tmp_path: Path):
+    _write_capture_file(tmp_path, "binance", DATE, 4_096)
+    raw, _ = paths_for(tmp_path, "binance", "trade", "BTCUSDT", f"{DATE}T00")
+    writing_marker_path(raw).write_text("12345")
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+    assert list(report["raw_bytes_by_stream"]) == ["depth_BTCUSDT"]

@@ -137,22 +137,36 @@ def _has_captured_anything(root: Path) -> bool:
     return next(raw_root.rglob(f"*{RAW_SUFFIX}"), None) is not None
 
 
-def _sum_raw_data_bytes(folder: Path) -> int:
-    """Bytes of captured data in one venue-day folder.
+def _measure_raw_bytes_by_stream(folder: Path) -> dict[str, int]:
+    """Bytes of captured data in one venue-day folder, split per stream-symbol.
 
     Only raw capture files count. Index files are derived, and a `.writing`
     marker is a sidecar holding a pid - counting bytes indiscriminately would
     let an hour that opened a stream and captured nothing report as present.
+
+    Split rather than summed because a venue-day total answers the wrong
+    question. One stream that is still flowing carries the whole folder over
+    zero, so `capture_status` reads "present" while every sibling has been dead
+    for days - the archive-of-order-book-with-no-trades failure, invisible in the
+    one number that was reported. Verified 2026-08-02 over four days with three
+    of four streams dead.
+
+    `RawWriter` names files `{stream}_{symbol}_{hour}` and both stream and symbol
+    may themselves contain underscores, so only the trailing hour can be split
+    off unambiguously. The key is therefore the `stream_symbol` prefix exactly as
+    it appears on disk, which is also how an operator finds the file.
     """
     if not folder.is_dir():
-        return 0
-    total = 0
+        return {}
+    bytes_by_stream: dict[str, int] = {}
     for path in folder.glob(f"*{RAW_SUFFIX}"):
         try:
-            total += path.stat().st_size
+            size = path.stat().st_size
         except OSError:
             continue          # rotated or removed mid-scan
-    return total
+        stream_symbol = path.name[: -len(RAW_SUFFIX)].rsplit("_", 1)[0]
+        bytes_by_stream[stream_symbol] = bytes_by_stream.get(stream_symbol, 0) + size
+    return bytes_by_stream
 
 
 def measure_daily_bytes(root: Path, days: int = 7) -> float:
@@ -232,7 +246,9 @@ def build_report(root: Path, venue: str, date: str,
             # stream being dropped entirely - and it is not a gap.
             corrupting_non_gap += 1
 
-    raw_data_bytes = _sum_raw_data_bytes(_venue_day_folder(root, venue, date))
+    raw_bytes_by_stream = _measure_raw_bytes_by_stream(
+        _venue_day_folder(root, venue, date))
+    raw_data_bytes = sum(raw_bytes_by_stream.values())
     if raw_data_bytes > 0:
         capture_status = STATUS_PRESENT
     elif _has_captured_anything(root):
@@ -256,6 +272,10 @@ def build_report(root: Path, venue: str, date: str,
         "silent_streams": silent_streams,
         "silent_stream_names": sorted(silent_stream_names),
         "raw_data_bytes": raw_data_bytes,
+        # Per stream-symbol, so a live stream cannot report presence on behalf of
+        # a dead sibling - see `_measure_raw_bytes_by_stream`. A stream that
+        # wrote nothing that day has no key at all.
+        "raw_bytes_by_stream": dict(sorted(raw_bytes_by_stream.items())),
         "capture_status": capture_status,
         "free_bytes": free_bytes,
         "daily_bytes": daily_bytes,
