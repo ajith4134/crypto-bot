@@ -52,60 +52,91 @@ class BinanceDepthTracker:
 class HyperliquidStalenessTracker:
     """No sequence numbers exist, so cadence is learned and stalls are inferred.
 
-    Fires at `multiple` x the learned inter-frame cadence, floored at
-    `floor_seconds` so fast streams do not alarm on ordinary jitter.
+    The threshold is the widest of three terms, and each answers a different
+    question. Getting any one of them wrong reintroduces the alarm storm this
+    class exists to prevent, so all three are load-bearing:
 
-    Two details make the learning work on a stream whose natural cadence is
-    *slower* than the floor - an illiquid l2Book updating every 8s against a 5s
-    floor:
+    `floor_seconds` - "how fast is too fast to bother alarming on?" Without it a
+    10ms stream alarms on ordinary jitter.
 
-    Warmup learns from every gap, alarming ones included. Refusing to learn from
-    a gap above the floor is self-defeating there: no gap ever qualifies, the
-    window never fills, the threshold stays pinned at the floor, and every single
-    frame is reported as an observation loss. That both floods the ledger and
-    makes a genuine 30-minute outage indistinguishable from the noise, since it
-    arrives with the same severity and shape as the false alarms around it. Once
-    `min_samples` gaps are in hand a baseline exists, and from then on stalls are
-    kept out of the window as before.
+    `multiple` x a low quantile of the window - "how much slower than typical is
+    suspicious?" The quantile is low, not the median, because stalls only ever
+    push gaps upward: the fast end of the distribution is where the true cadence
+    lives, and a low quantile survives a window that warmup filled with stalls
+    where a median would be dragged up by them.
 
-    Cadence is estimated from a low quantile of the window rather than its
-    median. Stalls only ever push gaps upward, so the fast end of the
-    distribution is where the true cadence lives; a low quantile survives a
-    window that warmup filled with stalls, where a median would be dragged up by
-    them and blind the tracker to later outages.
+    A high quantile of the window - "what does this stream do routinely?" This is
+    the term a low quantile alone cannot supply, and its absence is what made the
+    previous version alarm on 57% of frames forever on a healthy *bursty* stream.
+    On a stream that is 40% fast bursts and 60% ~6s cadence, the low quantile
+    lands inside the burst and puts the threshold under the stream's own ordinary
+    cadence. Every routine 6s gap then alarms - permanently, not just during
+    warmup - which is exactly the "a genuine outage is indistinguishable from the
+    noise" condition the alarming is supposed to prevent. Anchoring the threshold
+    at (by default) the 99th percentile of the window caps the false-alarm rate
+    at roughly 1% of frames by construction, whatever shape the distribution has.
+
+    Learning rule: a gap is learned from unless it exceeds `stall_multiple` x the
+    threshold. Being flagged is deliberately NOT enough to be excluded. Excluding
+    every flagged gap is what let a wrong baseline become self-reinforcing - the
+    window refilled only with the gaps that already agreed with it, so no amount
+    of evidence could correct it. A gap that is merely over the line is treated
+    as evidence the baseline may be wrong; a gap far beyond it is treated as a
+    stall and kept out, which is what keeps a real outage from teaching the
+    tracker to ignore outages.
+
+    This also removes the warmup special case entirely. A stream slower than the
+    floor (an illiquid l2Book updating every 8s against a 5s floor) learns its
+    cadence because an 8s gap is nowhere near 3x the 5s floor, so it is learned
+    despite being flagged.
     """
 
     def __init__(self, floor_seconds: float = 5.0, multiple: float = 10.0,
                  window: int = 200, min_samples: int = 10,
-                 cadence_quantile: float = 0.25) -> None:
+                 cadence_quantile: float = 0.25,
+                 routine_ceiling_quantile: float = 0.99,
+                 stall_multiple: float = 3.0) -> None:
         self._floor_ns = int(floor_seconds * 1e9)
         self._multiple = multiple
         self._min_samples = min_samples
         self._cadence_quantile = cadence_quantile
+        self._routine_ceiling_quantile = routine_ceiling_quantile
+        self._stall_multiple = stall_multiple
         self._gaps: deque[int] = deque(maxlen=window)
         self._last_ns: int | None = None
 
+    @staticmethod
+    def _quantile_ns(ordered: list[int], quantile: float) -> int:
+        return ordered[min(int(len(ordered) * quantile), len(ordered) - 1)]
+
     def _estimate_cadence_ns(self) -> int:
-        ordered = sorted(self._gaps)
-        index = min(int(len(ordered) * self._cadence_quantile), len(ordered) - 1)
-        return ordered[index]
+        return self._quantile_ns(sorted(self._gaps), self._cadence_quantile)
+
+    def _estimate_routine_ceiling_ns(self) -> int:
+        """The gap this stream does not routinely exceed, from the window itself."""
+        return self._quantile_ns(sorted(self._gaps), self._routine_ceiling_quantile)
 
     def has_baseline(self) -> bool:
         return len(self._gaps) >= self._min_samples
+
+    def _threshold_ns(self) -> int:
+        # Before a baseline exists there is nothing to compare against, so the
+        # floor is the only usable threshold.
+        if not self.has_baseline():
+            return self._floor_ns
+        ordered = sorted(self._gaps)
+        return max(
+            self._floor_ns,
+            int(self._quantile_ns(ordered, self._cadence_quantile) * self._multiple),
+            self._quantile_ns(ordered, self._routine_ceiling_quantile),
+        )
 
     def check(self, t_recv_ns: int) -> GapReport | None:
         last, self._last_ns = self._last_ns, t_recv_ns
         if last is None:
             return None
         gap = t_recv_ns - last
-
-        # Before a baseline exists there is nothing to compare against, so the
-        # floor is the only usable threshold.
-        if self.has_baseline():
-            threshold = max(self._floor_ns,
-                            int(self._estimate_cadence_ns() * self._multiple))
-        else:
-            threshold = self._floor_ns
+        threshold = self._threshold_ns()
 
         report = None
         if gap > threshold:
@@ -114,10 +145,10 @@ class HyperliquidStalenessTracker:
                 "threshold_seconds": threshold / 1e9,
             })
 
-        # During warmup every gap is learned from, or a stream slower than the
-        # floor could never establish a baseline. Once one exists, stalls are
-        # anomalies and stay out of the learning window.
-        if report is None or not self.has_baseline():
+        # A flagged gap is still learned from: it may be evidence the baseline is
+        # wrong rather than evidence the stream is sick. Only a gap far beyond
+        # the threshold is treated as a stall and kept out of the window.
+        if gap <= self._stall_multiple * threshold:
             self._gaps.append(gap)
 
         return report

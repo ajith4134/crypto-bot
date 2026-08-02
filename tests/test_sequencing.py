@@ -1,7 +1,32 @@
+import random
+
 from capture.sequencing import BinanceDepthTracker, HyperliquidStalenessTracker
 from capture.capture_ledger import SEVERITY_CORRUPTING, SEVERITY_OBSERVATION_LOSS
 
 S = 1_000_000_000  # one second in ns
+
+
+def _bursty_gaps_seconds(count: int, seed: int = 7) -> list[float]:
+    """A healthy but bursty stream: 60% of gaps near 6s, 40% near 0.5s.
+
+    Deliberately deterministic. This is the shape a low quantile alone gets
+    wrong - the quantile lands inside the burst and puts the alarm threshold
+    under the stream's own ordinary cadence.
+    """
+    rng = random.Random(seed)
+    return [(6.0 if rng.random() < 0.6 else 0.5) * (1 + rng.uniform(-0.05, 0.05))
+            for _ in range(count)]
+
+
+def _replay_gaps(tracker: HyperliquidStalenessTracker, gaps_seconds: list[float],
+                 start_ns: int = 1785648600 * S) -> tuple[list, int]:
+    now = start_ns
+    tracker.check(now)
+    reports = []
+    for gap in gaps_seconds:
+        now += int(gap * S)
+        reports.append(tracker.check(now))
+    return reports, now
 
 
 def test_binance_first_frame_is_not_a_gap():
@@ -134,3 +159,63 @@ def test_hyperliquid_stalls_do_not_poison_median():
     report = t.check(base + 7 * 60 * S + 6 * S + 40 * S)  # 40s gap
     assert report is not None, "Stall after burst should be detected"
     assert report.severity == SEVERITY_OBSERVATION_LOSS
+
+
+# --------------------------------------------------------------------------
+# A bursty-but-healthy stream must not sit in permanent alarm
+# --------------------------------------------------------------------------
+
+def test_bursty_healthy_stream_does_not_alarm_forever():
+    """The regression a low cadence quantile alone reintroduced.
+
+    On a stream that is 40% fast bursts and 60% ~6s cadence, a low quantile lands
+    inside the burst (p25 = 0.48s), pins the threshold at the 5s floor, and flags
+    every routine 6s gap. Because flagged gaps were then excluded from learning,
+    the window refilled with burst gaps only and the baseline could never
+    correct itself: 57% of frames flagged as observation_loss, permanently.
+
+    That is the same failure the slow-stream fix exists to prevent - a genuine
+    outage arriving with the same severity and shape as hundreds of false ones.
+    """
+    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    reports, _ = _replay_gaps(t, _bursty_gaps_seconds(600))
+
+    per_hundred = [sum(r is not None for r in reports[i:i + 100])
+                   for i in range(0, 600, 100)]
+    # Warmup may alarm; steady state must not. Frames 100 onward are steady state.
+    assert max(per_hundred[1:]) <= 10, (
+        f"alarms per 100 frames after warmup: {per_hundred} - a healthy 6s stream "
+        f"is being reported as a permanent outage")
+    assert sum(per_hundred) <= 60, f"{sum(per_hundred)}/600 frames flagged"
+
+
+def test_bursty_stream_still_flags_a_real_outage():
+    """Tolerating the burst must not cost the detection the tracker exists for."""
+    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    _, now = _replay_gaps(t, _bursty_gaps_seconds(600))
+
+    report = t.check(now + 30 * 60 * S)
+    assert report is not None
+    assert report.severity == SEVERITY_OBSERVATION_LOSS
+    assert report.detail["gap_seconds"] >= 1800
+    # The threshold tracks the stream's own 6s cadence, not the 0.5s burst.
+    assert report.detail["threshold_seconds"] > 5.0
+
+
+def test_a_stall_far_beyond_the_threshold_stays_out_of_the_window():
+    """Flagged-but-close gaps teach the baseline; genuine stalls must not.
+
+    Without this, a real 10-minute outage would widen the threshold and teach the
+    tracker to ignore the next one.
+    """
+    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    _, now = _replay_gaps(t, [1.0] * 199)
+    widest_before = max(t._gaps)
+
+    t.check(now + 600 * S)                       # a 10-minute outage
+    assert max(t._gaps) == widest_before, "a stall was learned as ordinary cadence"
+
+    # And the very next outage is still detected at the same threshold.
+    report = t.check(now + 600 * S + 600 * S)
+    assert report is not None
+    assert report.detail["threshold_seconds"] <= 10.0
