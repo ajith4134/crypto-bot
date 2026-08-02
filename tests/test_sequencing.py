@@ -76,6 +76,43 @@ def test_hyperliquid_long_gap_during_warmup_is_detected():
     assert report.detail["gap_seconds"] >= 500
 
 
+def test_hyperliquid_stream_slower_than_the_floor_learns_its_cadence():
+    """An illiquid l2Book updating every 8s against a 5s floor must not alarm forever.
+
+    Refusing to learn from any gap above the floor meant the window could never
+    fill on such a stream: the threshold stayed pinned at the floor and every
+    single frame became an observation_loss event. That floods the ledger and,
+    worse, makes a genuine outage arrive with the same severity and shape as the
+    hundreds of false ones around it.
+    """
+    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    base = 1785648600 * S
+    cadence_seconds = 8
+
+    reports = [t.check(base + i * cadence_seconds * S) for i in range(200)]
+    alarms = [r for r in reports if r is not None]
+
+    assert len(alarms) <= 10, f"{len(alarms)} false alarms on a steady 8s stream"
+    assert reports[-1] is None, "still alarming on ordinary cadence after 200 frames"
+    assert t.has_baseline(), "the tracker never learned a cadence"
+
+
+def test_hyperliquid_slow_stream_still_flags_a_real_outage():
+    """Learning a slow cadence must not cost the detection it exists for."""
+    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    base = 1785648600 * S
+    for i in range(200):
+        t.check(base + i * 8 * S)
+
+    last = base + 199 * 8 * S
+    report = t.check(last + 30 * 60 * S)          # a 30-minute outage
+    assert report is not None
+    assert report.severity == SEVERITY_OBSERVATION_LOSS
+    assert report.detail["gap_seconds"] >= 1800
+    # The threshold is derived from the learned 8s cadence, not the 5s floor.
+    assert report.detail["threshold_seconds"] > 5.0
+
+
 def test_hyperliquid_stalls_do_not_poison_median():
     """Stalls should not be included in the cadence learning window."""
     t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
