@@ -9,6 +9,29 @@ import zstandard
 from capture.frame_codec import IndexEntry, encode_index_entry, escape_payload, decode_index_entry, unescape_payload
 
 
+class PairLengthMismatch(Exception):
+    """Raised when raw and index files have mismatched line counts.
+
+    This indicates a partial write failure: the raw file received a frame but the
+    corresponding index entry failed to write. The files are corrupt and cannot be
+    safely read without repair.
+
+    Task 4's `reconcile_pair` function exists to rebuild missing index entries from
+    the raw file. A silent truncation would hide the exact condition it is designed
+    to fix, so this exception is raised instead of silently returning a truncated list.
+    """
+
+    def __init__(self, raw_path: Path, idx_path: Path, raw_count: int, idx_count: int) -> None:
+        self.raw_path = raw_path
+        self.idx_path = idx_path
+        self.raw_count = raw_count
+        self.idx_count = idx_count
+        super().__init__(
+            f"Pair length mismatch: {raw_path} has {raw_count} lines, "
+            f"{idx_path} has {idx_count} lines. Run reconcile_pair to repair."
+        )
+
+
 def hour_key(ts_ns: int) -> str:
     moment = dt.datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=dt.timezone.utc)
     return moment.strftime("%Y-%m-%dT%H")
@@ -74,12 +97,15 @@ class RawWriter:
         escaped, was_escaped = escape_payload(payload)
         entry = IndexEntry(n=self._n, t_recv_ns=t_recv_ns, t_exch_ms=t_exch_ms,
                            seq=seq, kind=kind, esc=was_escaped)
+        # Encode the index entry BEFORE writing anything. If encode_index_entry
+        # raises, no data is written to either file. Avoids creating a mismatch.
+        idx_line = encode_index_entry(entry)
+        # Now that encoding succeeded, write to both files. If raw write fails,
+        # neither file is affected. If idx write fails, raw has the frame but idx
+        # doesn't; read_pair will detect and raise PairLengthMismatch.
         self._raw_z.write((escaped + "\n").encode("utf-8"))
-        # Increment n after raw write succeeds. If idx write fails, raw and idx will
-        # be mismatched, but n stays consistent with the number of raw lines written.
-        # The exception propagates so the caller sees the failure.
+        self._idx_z.write((idx_line + "\n").encode("utf-8"))
         self._n += 1
-        self._idx_z.write((encode_index_entry(entry) + "\n").encode("utf-8"))
         return entry.n
 
     def flush(self) -> None:
@@ -120,6 +146,13 @@ def read_pair(raw_path: Path, idx_path: Path) -> list[tuple[str, IndexEntry]]:
     with open(idx_path, "rb") as fh:
         idx_text = dctx.stream_reader(fh).read().decode("utf-8")
         idx_lines = idx_text.rstrip("\n").split("\n") if idx_text else []
+
+    # Detect and refuse to paper over partial write failures. If raw and idx have
+    # different line counts, it means a frame was written but its index entry was not.
+    # This is the exact condition that Task 4's reconcile_pair is designed to repair.
+    if len(raw_lines) != len(idx_lines):
+        raise PairLengthMismatch(Path(raw_path), Path(idx_path), len(raw_lines), len(idx_lines))
+
     return [
         (unescape_payload(r) if entry.esc else r, entry)
         for r, i in zip(raw_lines, idx_lines)
