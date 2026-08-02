@@ -5,7 +5,7 @@ import pytest
 
 from capture.venue_recorder import VenueRecorder
 from capture.venues.binance import BinanceVenue
-from capture.capture_ledger import read_all, SEVERITY_CORRUPTING
+from capture.capture_ledger import read_all, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO
 
 
 async def _frames(items):
@@ -129,3 +129,41 @@ async def test_frame_iterator_failure_still_closes_writers_and_ledger(tmp_path: 
     pairs = read_pair(raw_file, idx_file)   # raises if the zstd frame was never finalized
     assert len(pairs) == 1
     assert pairs[0][0] == good
+
+
+@pytest.mark.asyncio
+async def test_close_still_closes_remaining_writers_and_ledger_when_one_fails(tmp_path: Path):
+    """close() must attempt every writer (and the ledger) even if an earlier
+    one raises - e.g. a disk-full during one writer's zstd footer write must
+    not orphan every writer after it in iteration order, plus the ledger,
+    with unflushed buffered data. The failure must still surface to the
+    caller, just not at the cost of abandoning the rest of the cleanup."""
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        clock_ns=lambda: 1785648600_000_000_000)
+
+    # Two distinct writers with open, buffered handles.
+    w1 = rec._writer_for("depth", "BTCUSDT")
+    w1.append('{"a":1}', 1785648600_000_000_000, None, None)
+    w2 = rec._writer_for("aggTrade", "BTCUSDT")
+    w2.append('{"a":2}', 1785648600_000_000_000, None, None)
+
+    # An open ledger handle too.
+    rec._ledger.record(LedgerEvent(
+        ts_ns=1785648600_000_000_000, venue="binance", stream="depth",
+        kind="info", severity=SEVERITY_INFO, detail={}))
+
+    assert w1._raw_z is not None and w2._raw_z is not None
+    assert rec._ledger._fh is not None
+
+    def _boom() -> None:
+        raise OSError("disk full")
+    w1.close = _boom
+
+    with pytest.raises(OSError, match="disk full"):
+        rec.close()
+
+    # w1 (first in iteration order) is the one that raised - w2 and the
+    # ledger must still have been closed rather than left open/unflushed.
+    assert w2._raw_z is None
+    assert rec._ledger._fh is None

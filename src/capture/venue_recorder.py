@@ -131,6 +131,23 @@ class VenueRecorder:
         return dict(self._stats)
 
     def close(self) -> None:
+        # Every writer (and the ledger) must get a close attempt regardless of
+        # whether an earlier one raised - e.g. a disk-full during one writer's
+        # zstd footer write must not orphan the rest with unflushed buffers.
+        # Errors are collected and re-raised after every close was attempted,
+        # rather than propagating from the first failure and abandoning the loop.
+        errors: list[Exception] = []
         for writer in self._writers.values():
-            writer.close()
-        self._ledger.close()
+            try:
+                writer.close()
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            self._ledger.close()
+        except Exception as exc:
+            errors.append(exc)
+
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("errors while closing venue recorder resources", errors)
