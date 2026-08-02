@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import tempfile
 from pathlib import Path
 
 import zstandard
@@ -156,21 +158,40 @@ def _read_lines(path: Path) -> list[str]:
 
 
 def _write_lines(path: Path, lines: list[str]) -> None:
+    """Write lines atomically using a temporary file.
+
+    A crash during write leaves the original file untouched; any reader or
+    retry sees either the old content or the new content, never a partial
+    or corrupted frame.
+    """
     cctx = zstandard.ZstdCompressor(level=3)
-    with open(path, "wb") as fh:
-        with cctx.stream_writer(fh) as w:
-            for line in lines:
-                w.write((line + "\n").encode("utf-8"))
+    # Write to a temporary file in the same directory so os.replace() is atomic
+    fd, tmpfile = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            with cctx.stream_writer(fh) as w:
+                for line in lines:
+                    w.write((line + "\n").encode("utf-8"))
+        # Atomic replacement: any reader sees either old or new, never partial
+        os.replace(tmpfile, path)
+    except Exception:
+        os.unlink(tmpfile)
+        raise
 
 
 def read_pair(raw_path: Path, idx_path: Path) -> list[tuple[str, IndexEntry]]:
-    dctx = zstandard.ZstdDecompressor()
-    with open(raw_path, "rb") as fh:
-        raw_text = dctx.stream_reader(fh).read().decode("utf-8")
-        raw_lines = raw_text.rstrip("\n").split("\n") if raw_text else []
-    with open(idx_path, "rb") as fh:
-        idx_text = dctx.stream_reader(fh).read().decode("utf-8")
-        idx_lines = idx_text.rstrip("\n").split("\n") if idx_text else []
+    """Read a raw/index pair, returning (payload, entry) tuples.
+
+    Raises PairLengthMismatch if the files have different line counts (indicating
+    a partial write failure that reconcile_pair is designed to repair).
+
+    For recovered entries (kind=="recovered"), the escape state is unrecoverable
+    from the raw line alone, so the payload is returned as stored and may still
+    be in escaped form. This is why kind="recovered" exists — so downstream can
+    exclude these entries explicitly and handle them as needed.
+    """
+    raw_lines = _read_lines(raw_path)
+    idx_lines = _read_lines(idx_path)
 
     # Detect and refuse to paper over partial write failures. If raw and idx have
     # different line counts, it means a frame was written but its index entry was not.
@@ -178,11 +199,17 @@ def read_pair(raw_path: Path, idx_path: Path) -> list[tuple[str, IndexEntry]]:
     if len(raw_lines) != len(idx_lines):
         raise PairLengthMismatch(Path(raw_path), Path(idx_path), len(raw_lines), len(idx_lines))
 
-    return [
-        (unescape_payload(r) if entry.esc else r, entry)
-        for r, i in zip(raw_lines, idx_lines)
-        for entry in [decode_index_entry(i)]
-    ]
+    result = []
+    for r, i in zip(raw_lines, idx_lines):
+        entry = decode_index_entry(i)
+        # For recovered entries, the escape state is unknown, so return as-stored
+        # (which may still be escaped). For data entries, unescape if marked.
+        if entry.kind == "recovered":
+            payload = r
+        else:
+            payload = unescape_payload(r) if entry.esc else r
+        result.append((payload, entry))
+    return result
 
 
 def reconcile_pair(raw_path: Path, idx_path: Path) -> int:
@@ -191,6 +218,14 @@ def reconcile_pair(raw_path: Path, idx_path: Path) -> int:
     Returns the number of entries repaired. Never discards raw data, and never
     invents a receipt timestamp - unknown times are recorded as 0 with
     kind="recovered" so downstream can exclude them explicitly.
+
+    Limitation: The escape state (whether a payload was escaped) is unrecoverable
+    from the raw line alone. Given only stored bytes, you cannot distinguish
+    "original contained a real newline, was escaped" from "original literally
+    contained backslash-then-n and was not escaped". Both produce identical disk
+    bytes. Therefore, read_pair returns recovered entries' payloads as stored,
+    which may still be in escaped form. This is why kind="recovered" exists —
+    downstream must exclude or handle these entries explicitly.
     """
     raw_lines = _read_lines(raw_path)
     idx_lines = _read_lines(idx_path)
