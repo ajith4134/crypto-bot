@@ -67,8 +67,10 @@ than baked in wrong.
 
 | Tier | Symbols | Streams |
 |---|---|---|
-| **Core** | ~4–5 majors, both venues | Full L2 depth diffs + trades + funding + open interest + liquidations |
-| **Tail** | As wide as venues stream | Trades + funding + open interest + liquidations. **No depth** |
+| **Core** | `BTC`, `ETH`, `SOL` — Binance USDⓈ-M perps + Hyperliquid perps | Full L2 depth diffs + trades + funding + open interest + liquidations |
+| **Tail** | Every perp each venue lists, discovered dynamically | Trades + funding + open interest + liquidations. **No depth** |
+
+Exact instrument selection and the reasoning behind three-not-five, and futures-not-spot, are in §11.
 
 Tail breadth is a requirement, not a default — see §8 R1.
 
@@ -328,9 +330,44 @@ Mitigations to evaluate during planning, cheapest first:
 **Until resolved, `capture_health` must alert on absence, not merely on error** — a stopped recorder
 produces no errors at all, which is exactly why silent outages go unnoticed.
 
-## 11. Open questions for planning
+## 11. Resolved defaults
 
-1. Exact core symbol list (4–5 majors) and tail universe definition per venue
-2. Local retention window — 7 days assumed, confirm against measured daily volume
-3. Alert channel for `capture_health` — no notification path exists yet
-4. Whether to capture Binance spot, futures, or both for the core tier
+Decided 2026-08-02 with stated reasoning. All are reversible before implementation; none block planning.
+
+### Q1 — Core symbol list and tail universe
+
+**Core (deep, L2 depth):** `BTC`, `ETH`, `SOL` on both venues. Three, not five — depth is what
+explodes storage, and the runway is the binding constraint until B1 resolves. Expanding the core
+later costs only storage; it does not require rework.
+
+**Tail (broad, no depth):** every perpetual instrument each venue lists, discovered dynamically by
+`universe_tracker` rather than hardcoded. A static list would silently miss new listings — which
+are among the highest-signal events the scanning design depends on (R1).
+
+### Q2 — Local retention window
+
+**Moot until offload works.** Local-only mode never prunes (§10 B1), so retention is not enforced
+and the archive grows monotonically. The 7-day window activates only once GCS upload is verified.
+Revisit with measured volume at that point, not before.
+
+### Q3 — Alert channel for `capture_health`
+
+**Default: structured JSON lines to `~/capture/health/alerts.ndjson`, plus non-zero exit on a
+`capture_health --check` invocation** so any external scheduler or human can poll it.
+
+Deliberately no email/Slack/webhook in this sub-project — that is a credential-bearing outward
+integration, and it belongs with the operations sub-project rather than being smuggled into Layer 0.
+**The consequence must be stated plainly: until an external channel exists, alerts are pull-only and
+nobody is notified of a silent outage.** That is acceptable only because B2 is scheduled work.
+
+### Q4 — Binance spot, futures, or both
+
+**Futures (USDⓈ-M perpetuals) for the core tier.** Three reasons:
+
+1. **It is the tradeable surface.** Hyperliquid is perps-only, so futures keeps the two venues
+   comparable and matches what execution will actually touch
+2. **Better gap detection** — futures depth carries `pu` (previous final update id), giving explicit
+   sequence-chain validation that spot's `U`/`u` alone does not
+3. **Richer timestamps** — futures carries both `E` (event) and `T` (transaction); spot has only `E`
+
+Spot is not captured in this sub-project. Adding it later is additive and costs no rework.
