@@ -271,18 +271,62 @@ fills. The rule:
   remaining, alert daily at **14 days**, and at **7 days** raise a **hard decision point** —
   by then either offload works, or a human must consciously choose what to stop capturing.
   Runway is computed from measured 7-day average daily bytes, not a fixed threshold.
-- **B1 therefore carries a deadline, not just a blocker.** At ~1–2 GB/day against 91 GB free, the
-  hard decision point arrives in roughly **6–12 weeks** from first capture. Resolving GCS access is
-  not urgent on day one; it is unambiguously urgent before then.
+- **B1 carries a deadline, not just a blocker** — see the two-stage runway below.
 
-### B2 — Reboot persistence unresolved (non-blocking, needs mitigation)
+#### Disk runway with the 400 GB ceiling
+
+Operator constraint (stated 2026-08-02): **the VM disk can be grown, up to a hard ceiling of 400 GB.**
+That extends the runway substantially but does not remove the need for offload — capture is
+unbounded and 400 GB is not.
+
+| Stage | Usable | Runway at 1–2 GB/day |
+|---|---|---|
+| Current disk | 91 GB free | **45–90 days** |
+| After growth to ceiling | ~395 GB | **~200–400 days total** |
+
+**Conclusion: GCS offload is not urgent for months, but it is eventually mandatory.** The 400 GB
+ceiling is a delay, not an escape — at which point the only remaining levers are offload, or
+deliberately capturing less.
+
+#### Disk growth requires a reboot — which makes B2 a prerequisite, not a parallel concern
+
+Verified 2026-08-02: root is **ext4 on `/dev/sda1`**; `/etc/cloud/cloud.cfg` enables the
+**`growpart`** module; `growpart` and `resize2fs` are installed but require root
+(`open: Permission denied while opening /dev/root`).
+
+Therefore, without sudo the growth path is:
+
+1. Resize the disk in the GCP console — **online, no reboot needed for this step**
+2. **Reboot**, so cloud-init's `growpart` extends the partition and filesystem automatically
+
+Step 2 is the problem. **A reboot silently stops capture while B2 is unresolved** (no linger, no
+root systemd, so nothing restarts the recorder). The two blockers compound:
+
+> **B2 must be resolved before the first disk resize**, or growing the disk costs an
+> unknown-duration capture outage — and the outage is silent, which is worse than its length.
+
+Planning consequence: solving reboot persistence is **not** an optional hardening task to schedule
+later. It gates the first disk growth, which the runway table puts at 45–90 days.
+
+### B2 — Reboot persistence unresolved (**upgraded to blocking**, gates first disk growth)
 
 `KillUserProcesses=false` means the recorder survives **logout**. It does **not** survive a VM
 **reboot**, because linger cannot be enabled and there is no root systemd access.
 
-Mitigations to evaluate during planning: user `@reboot` crontab (untested), an external watchdog, or
-obtaining linger from a project administrator. **Until resolved, a reboot means a silent capture
-outage** — so `capture_health` must alert on absence, not merely on error.
+**Originally assessed as non-blocking. Upgraded after the disk-growth analysis above:** the only
+sudo-free path to a larger disk requires a reboot, so B2 gates the first resize — which the runway
+table places at **45–90 days**. It is a scheduled dependency, not a background concern.
+
+Mitigations to evaluate during planning, cheapest first:
+
+1. **User `@reboot` crontab** — untested on this box; verify whether cron runs user `@reboot` jobs
+   without linger. If it works, this is the whole solution and costs nothing
+2. **External watchdog** — an off-box check that alerts (or restarts via SSH) on capture silence
+3. **Obtain linger or root systemd** from whoever administers the GCP project — cleanest, but
+   depends on access this account does not have
+
+**Until resolved, `capture_health` must alert on absence, not merely on error** — a stopped recorder
+produces no errors at all, which is exactly why silent outages go unnoticed.
 
 ## 11. Open questions for planning
 
