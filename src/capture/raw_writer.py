@@ -618,9 +618,10 @@ def _quarantine_file(path: Path) -> Path:
 def _salvage_raw_lines(raw_path: Path) -> tuple[list[str], bool]:
     """Read a raw file, falling back to its intact prefix when the tail is torn.
 
-    Returns (lines, was_torn). Salvage is at line granularity: every complete,
-    newline-terminated line decoded before the damage is a whole frame and is
-    kept. What is lost is whatever the torn zstd block could not produce.
+    Returns (lines, was_torn). Every complete, newline-terminated line that
+    decoded before the damage is a whole frame and is kept. What is available to
+    keep is bounded by zstd's compressed block, not by the line - see the
+    limitation noted on `reconcile_pair`.
     """
     try:
         return _read_lines(raw_path), False
@@ -737,11 +738,23 @@ def reconcile_pair(raw_path: Path, idx_path: Path) -> RepairOutcome:
         entry_line_by_n[n] = encode_index_entry(IndexEntry(
             n=n, t_recv_ns=0, t_exch_ms=None, seq=None, kind="recovered", esc=False))
 
-    # Raw first: if the process dies between the two writes, the index is the
-    # file repair can rebuild and the raw file is the one it cannot.
+    # Index first, and the order is load-bearing: repair must survive being
+    # interrupted halfway by the same crash that caused the damage.
+    #
+    # Writing the raw file first and dying leaves a salvaged (short) raw file
+    # beside the original (long) index. On the next run the raw file is no longer
+    # torn, so the overrunning index is refused as UnrepairableIndex - and that
+    # refusal is correct, which makes it a dead end: exactly the trap this
+    # function exists to remove.
+    #
+    # Writing the index first and dying leaves the torn raw file untouched beside
+    # a short index. The next run salvages the raw file exactly as this one did,
+    # finds the index consistent with it, and finishes the job. The raw file's
+    # bytes are not at risk either way - both originals are already quarantined
+    # above, and `_write_lines` replaces by inode swap rather than in place.
+    _write_lines(idx_path, [entry_line_by_n[n] for n in range(len(raw_lines))])
     if raw_was_torn:
         _write_lines(raw_path, raw_lines)
-    _write_lines(idx_path, [entry_line_by_n[n] for n in range(len(raw_lines))])
 
     # "Repaired" must mean "a writer can resume", not "the tool ran". This is the
     # same check `_open` makes, so passing it here is the property that makes

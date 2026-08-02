@@ -433,6 +433,58 @@ def test_reconcile_salvages_when_both_files_are_torn(tmp_path: Path):
     assert [p[1].n for p in pairs] == list(range(len(pairs)))
 
 
+def test_a_repair_interrupted_halfway_can_still_be_finished(tmp_path: Path):
+    """Repair runs after a crash, so it has to survive being crashed itself.
+
+    The write order is load-bearing. Writing the salvaged raw file first and
+    dying leaves a short raw file beside the original long index; the raw file is
+    no longer torn, so the overrunning index is correctly refused as
+    UnrepairableIndex - a dead end, which is the trap reconcile_pair exists to
+    remove. Writing the index first leaves the torn raw file untouched, and the
+    next run redoes the whole salvage.
+    """
+    import capture.raw_writer as raw_writer_module
+
+    for session in range(3):
+        w = RawWriter(tmp_path, "binance", "trades", "BTCUSDT")
+        for i in range(4):
+            w.append(f'{{"session":{session},"i":{i}}}',
+                     t_recv_ns=HOUR_05 + session * 4 + i, t_exch_ms=None, seq=None)
+        w.close()
+
+    raw, idx = paths_for(tmp_path, "binance", "trades", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    real_write_lines = raw_writer_module._write_lines
+    calls = []
+
+    def write_lines_dying_on_the_second_file(path, lines):
+        calls.append(Path(path))
+        if len(calls) == 2:
+            raise OSError(errno.EIO, "crashed mid-repair")
+        return real_write_lines(path, lines)
+
+    monkeypatched = pytest.MonkeyPatch()
+    monkeypatched.setattr(raw_writer_module, "_write_lines",
+                          write_lines_dying_on_the_second_file)
+    with pytest.raises(OSError):
+        reconcile_pair(raw, idx)
+    monkeypatched.undo()
+
+    # The property that matters: the interrupted repair is finishable. Under the
+    # other write order this raises UnrepairableIndex and the hour is stuck.
+    outcome = reconcile_pair(raw, idx)
+    assert outcome.raw_frames_kept == 8
+    resumed = RawWriter(tmp_path, "binance", "trades", "BTCUSDT")
+    resumed.append('{"frame":"new"}', t_recv_ns=HOUR_05 + 100, t_exch_ms=None, seq=None)
+    resumed.close()
+    assert len(read_pair(raw, idx)) == 9
+
+    # Why it is finishable: the raw file was still the torn original when the
+    # crash landed, so the second run redid the whole salvage.
+    assert calls[0] == idx and calls[1] == raw
+
+
 def test_reconcile_rebuilds_an_index_that_is_missing_entirely(tmp_path: Path):
     """A missing index is the extreme of the damage repair exists to fix.
 
