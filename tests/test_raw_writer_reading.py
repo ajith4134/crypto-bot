@@ -69,7 +69,7 @@ def test_reconcile_inserts_a_recovered_entry_at_the_hole_not_at_the_end(tmp_path
                                       seq={"id": 3}, kind="data", esc=False)),
     ])
 
-    assert reconcile_pair(raw, idx) == 2
+    assert reconcile_pair(raw, idx).entries_rebuilt == 2
 
     pairs = read_pair(raw, idx)
     assert [p[0] for p in pairs] == [f'{{"frame":{i}}}' for i in range(4)]
@@ -212,7 +212,7 @@ def test_trailing_empty_payload_does_not_create_a_mismatch(tmp_path: Path):
     raw, idx = paths_for(tmp_path, "hyperliquid", "l2Book", "BTC", "2026-08-02T05")
     pairs = read_pair(raw, idx)       # used to raise PairLengthMismatch forever
     assert [p[0] for p in pairs] == ['{"a":1}', '']
-    assert reconcile_pair(raw, idx) == 0
+    assert reconcile_pair(raw, idx).entries_rebuilt == 0
 
 
 def test_consecutive_empty_payloads_each_keep_their_own_line(tmp_path: Path):

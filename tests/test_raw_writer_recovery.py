@@ -26,7 +26,7 @@ def test_reconcile_rebuilds_missing_index_entries(tmp_path: Path):
     _truncate_index_by_one(idx)
 
     repaired = reconcile_pair(raw, idx)
-    assert repaired == 1
+    assert repaired.entries_rebuilt == 1
 
     pairs = read_pair(raw, idx)
     assert len(pairs) == 3
@@ -40,7 +40,7 @@ def test_reconcile_is_noop_when_aligned(tmp_path: Path):
     w.append('{"i":0}', t_recv_ns=1785648600_000_000_000, t_exch_ms=None, seq=None)
     w.close()
     raw, idx = paths_for(tmp_path, "binance", "trades", "ETHUSDT", "2026-08-02T05")
-    assert reconcile_pair(raw, idx) == 0
+    assert reconcile_pair(raw, idx).entries_rebuilt == 0
 
 
 def test_recovered_entry_with_escaped_payload_returns_as_stored():
@@ -68,7 +68,7 @@ def test_recovered_entry_with_escaped_payload_returns_as_stored():
         _truncate_index_by_one(idx)
 
         repaired = reconcile_pair(raw, idx)
-        assert repaired == 1
+        assert repaired.entries_rebuilt == 1
 
         pairs = read_pair(raw, idx)
         assert len(pairs) == 1

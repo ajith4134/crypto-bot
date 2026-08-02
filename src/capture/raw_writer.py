@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import shutil
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import zstandard
@@ -13,6 +15,7 @@ from capture.frame_codec import IndexEntry, encode_index_entry, escape_payload, 
 RAW_SUFFIX = ".ndjson.zst"
 IDX_SUFFIX = ".idx.zst"
 WRITING_MARKER_SUFFIX = ".writing"
+QUARANTINE_SUFFIX = ".quarantine"
 
 
 class RawCaptureError(Exception):
@@ -106,6 +109,23 @@ class UnrepairableIndex(RawCaptureError):
         self.idx_path = idx_path
         self.reason = reason
         super().__init__(f"Cannot reconcile {idx_path} against {raw_path}: {reason}")
+
+
+class MissingPairFile(RawCaptureError):
+    """Raised when `reconcile_pair` is given a path that does not exist.
+
+    A bare `FileNotFoundError` escapes `RawCaptureError`, so a caller catching
+    the documented base class - the whole point of that base class - misses it
+    and treats an absent hour as an unexpected crash.
+
+    A missing *index* is not this error: it is the extreme of the damage repair
+    exists to fix, and is rebuilt from the raw file like any other hole.
+    """
+
+    def __init__(self, path: Path, role: str) -> None:
+        self.path = path
+        self.role = role
+        super().__init__(f"Cannot reconcile: the {role} file {path} does not exist.")
 
 
 class HourStillBeingWritten(RawCaptureError):
@@ -283,8 +303,23 @@ class RawWriter:
             marker.write_text(str(os.getpid()), encoding="utf-8")
         except OSError:
             # The marker only guards reconcile_pair; failing to place it must not
-            # cost live frames. Repair stays safe because the pair is still
-            # length-checked before and after any repair.
+            # cost live frames, so the hour is opened without one.
+            #
+            # Be honest about what that costs: with no marker on disk,
+            # is_hour_being_written() reports this live hour as idle and
+            # reconcile_pair will repair it, swapping the index inode out from
+            # under the descriptor this writer still holds. Every index entry
+            # written afterwards lands in the orphaned inode and is lost. The
+            # post-repair appendability check in reconcile_pair does not prevent
+            # that - it runs before those entries are written, so it can only
+            # catch a writer that was already mid-hour, not one that keeps
+            # writing after the swap.
+            #
+            # This is accepted rather than fixed: refusing to open the hour would
+            # turn one unwritable sidecar into total capture loss for the stream,
+            # and the trigger (ENOSPC or a permission fault on a directory whose
+            # raw files just opened successfully) is both rare and one that stops
+            # frames landing anyway.
             marker = None
         self._marker_path = marker
         self._hour, self._n = hour, resume_n
@@ -515,34 +550,139 @@ def read_pair(raw_path: Path, idx_path: Path) -> list[tuple[str, IndexEntry]]:
     return result
 
 
-def reconcile_pair(raw_path: Path, idx_path: Path) -> int:
-    """Rebuild index entries for raw lines a crash left undescribed.
+@dataclass(frozen=True)
+class RepairOutcome:
+    """What `reconcile_pair` actually did, including what it could not save.
 
-    Returns the number of entries repaired. Never discards raw data, and never
-    invents a receipt timestamp - unknown times are recorded as 0 with
+    `entries_rebuilt` alone reads reassuringly on a repair that recovered every
+    frame's bytes while losing every frame's timestamp, so the losses are
+    reported beside it rather than left to be inferred from the file.
+    """
+
+    entries_rebuilt: int = 0
+    """Index entries reconstructed as kind="recovered" for raw frames that had none.
+
+    Each one is a frame whose receipt time, exchange time and sequence numbers
+    are gone. The payload bytes survive.
+    """
+
+    entries_discarded: int = 0
+    """Index entries dropped because the frames they described did not survive.
+
+    Their metadata still exists in the quarantined index.
+    """
+
+    raw_frames_kept: int = 0
+    """Raw frames the pair holds after the repair."""
+
+    raw_was_salvaged: bool = False
+    """True when the raw file was torn and was rewritten to its intact prefix.
+
+    The number of raw frames *lost* is deliberately not reported: a torn zstd
+    block yields no count of what it was carrying. `entries_discarded` is a lower
+    bound whenever the index outlived the raw file, and nothing bounds it when
+    both were torn together. Reporting a number here would invent one.
+    """
+
+    quarantined_paths: tuple[Path, ...] = field(default_factory=tuple)
+    """Byte-for-byte copies of every file this repair overwrote."""
+
+    def __bool__(self) -> bool:
+        return bool(self.entries_rebuilt or self.entries_discarded
+                    or self.raw_was_salvaged)
+
+
+def _quarantine_file(path: Path) -> Path:
+    """Copy `path` beside itself before a repair overwrites it.
+
+    Repair is the only thing in this module that destroys data, and it does so
+    exactly when the data is already damaged - the worst moment to be wrong about
+    what was salvageable. The original bytes are kept verbatim so a later, better
+    tool (or a human) can still work on them.
+
+    The suffix goes on the end of the full name, not in place of the existing
+    one, so a quarantined file never matches a raw/index glob and cannot be
+    mistaken for an hour of its own.
+    """
+    path = Path(path)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    destination = path.parent / f"{path.name}{QUARANTINE_SUFFIX}-{stamp}"
+    attempt = 0
+    while destination.exists():
+        attempt += 1
+        destination = path.parent / f"{path.name}{QUARANTINE_SUFFIX}-{stamp}.{attempt}"
+    shutil.copy2(path, destination)
+    return destination
+
+
+def _salvage_raw_lines(raw_path: Path) -> tuple[list[str], bool]:
+    """Read a raw file, falling back to its intact prefix when the tail is torn.
+
+    Returns (lines, was_torn). Salvage is at line granularity: every complete,
+    newline-terminated line decoded before the damage is a whole frame and is
+    kept. What is lost is whatever the torn zstd block could not produce.
+    """
+    try:
+        return _read_lines(raw_path), False
+    except TruncatedFrameFile as exc:
+        return list(exc.recovered_lines), True
+
+
+def reconcile_pair(raw_path: Path, idx_path: Path) -> RepairOutcome:
+    """Repair a raw/index pair until a `RawWriter` can append to it again.
+
+    This is the remedy `HourFileNotAppendable` names, so it has one hard
+    obligation: refuse -> repair -> resume must terminate. Every damage shape a
+    crash can leave has to come out of here appendable, or the refusal is a trap
+    with no exit and the venue never records again.
+
+    What it does, in order:
+
+    * Refuses while a writer still holds the hour open (HourStillBeingWritten).
+      The index is replaced by inode swap, and a live writer would keep filling
+      the orphaned inode.
+    * Salvages a torn raw file down to its last intact line. Those lines are
+      whole frames; the bytes after them cannot be reconstructed from anywhere,
+      so they are counted as lost rather than quietly written out of existence.
+    * Salvages a torn index the same way. The index is rebuilt wholesale anyway.
+    * Rebuilds entries for raw lines that have none, located by `n` rather than
+      assumed to be a suffix - an index write can fail mid-stream with later ones
+      succeeding, and appending the recovered entries at the end would shift
+      every later entry onto the wrong frame.
+    * Drops index entries describing frames the salvage could not keep. This is
+      allowed ONLY when the raw file was torn, because only then is their absence
+      explained. An index that overruns an intact raw file is still refused
+      (UnrepairableIndex): that is corruption, not a crash, and an operator
+      should look at it.
+    * Verifies afterwards that the pair is genuinely appendable, so "repaired"
+      never means "still stuck".
+
+    Nothing is overwritten without a byte-for-byte copy being quarantined beside
+    it first - see `_quarantine_file`. The returned `RepairOutcome` reports what
+    was rebuilt and what was lost; the quarantine files are the durable record.
+
+    Never invents a receipt timestamp: unknown times are recorded as 0 with
     kind="recovered" so downstream can exclude them explicitly.
 
-    Missing entries are located by `n`, not by assuming they are a suffix. An
-    index write can fail mid-stream and later ones succeed, leaving the hole in
-    the middle; appending the recovered entries at the end would then shift every
-    later entry onto the wrong frame.
-
-    Refuses when a writer still holds the hour open (HourStillBeingWritten):
-    the index is replaced by inode swap, and a live writer would keep writing
-    into the orphaned inode.
-
-    A torn index tail is tolerated - the index is rebuilt wholesale anyway, so
-    the intact prefix is used and the damaged frame dropped. A torn *raw* tail is
-    not: those frames cannot be reconstructed from anywhere, so TruncatedFrameFile
-    propagates rather than being silently written out of existence.
-
-    Limitation: The escape state (whether a payload was escaped) is unrecoverable
+    Limitation: the escape state (whether a payload was escaped) is unrecoverable
     from the raw line alone. Given only stored bytes, you cannot distinguish
     "original contained a real newline, was escaped" from "original literally
     contained backslash-then-n and was not escaped". Both produce identical disk
-    bytes. Therefore, read_pair returns recovered entries' payloads as stored,
+    bytes. Therefore read_pair returns recovered entries' payloads as stored,
     which may still be in escaped form. This is why kind="recovered" exists -
     downstream must exclude or handle these entries explicitly.
+
+    Limitation: salvage granularity is zstd's compressed block, not the line.
+    Nothing at all decodes from a torn block - verified against zstandard 0.25.0
+    for decompressobj, stream_reader and chunked stream_reader alike - and an
+    hour written in one open is a single block. So one chopped byte costs the
+    whole hour's raw frames, or the whole index's timestamps, not a tail of them.
+    An hour that survived several opens keeps every complete frame before the
+    damaged one. Only a more frequent zstd frame boundary in `RawWriter` would
+    bound this, and that is a capture-spec decision about storage cost rather
+    than something the repair tool can decide. `entries_rebuilt` and
+    `entries_discarded` are reported separately so the size of the loss is
+    visible instead of hidden behind one reassuring "repaired" number.
     """
     raw_path, idx_path = Path(raw_path), Path(idx_path)
 
@@ -550,14 +690,18 @@ def reconcile_pair(raw_path: Path, idx_path: Path) -> int:
     if is_live:
         raise HourStillBeingWritten(raw_path, marker, pid)
 
-    raw_lines = _read_lines(raw_path)
-    idx_was_truncated = False
-    try:
-        idx_lines = _read_lines(idx_path)
-    except TruncatedFrameFile as exc:
-        idx_lines, idx_was_truncated = exc.recovered_lines, True
+    raw_exists, idx_exists = raw_path.exists(), idx_path.exists()
+    if not raw_exists:
+        if not idx_exists:
+            # Neither file exists: an unwritten hour is already appendable.
+            return RepairOutcome()
+        raise MissingPairFile(raw_path, "raw")
+
+    raw_lines, raw_was_torn = _salvage_raw_lines(raw_path)
+    idx_lines, idx_was_torn = _salvage_raw_lines(idx_path) if idx_exists else ([], False)
 
     entry_line_by_n: dict[int, str] = {}
+    entries_discarded = 0
     previous_n = -1
     for position, line in enumerate(idx_lines):
         n = decode_index_entry(line).n
@@ -566,19 +710,48 @@ def reconcile_pair(raw_path: Path, idx_path: Path) -> int:
                 raw_path, idx_path,
                 f"index line {position} carries n={n}, which does not follow n={previous_n}")
         if n >= len(raw_lines):
-            raise UnrepairableIndex(
-                raw_path, idx_path,
-                f"index line {position} carries n={n} but the raw file holds only "
-                f"{len(raw_lines)} frames, so it describes a frame that does not exist")
+            if not raw_was_torn:
+                raise UnrepairableIndex(
+                    raw_path, idx_path,
+                    f"index line {position} carries n={n} but the raw file holds only "
+                    f"{len(raw_lines)} frames, so it describes a frame that does not exist")
+            # The raw tail is torn, so this entry describes a frame the damage
+            # took. Its metadata survives only in the quarantined index.
+            entries_discarded += 1
+            previous_n = n
+            continue
         entry_line_by_n[n] = line
         previous_n = n
 
     missing = [n for n in range(len(raw_lines)) if n not in entry_line_by_n]
-    if not missing and not idx_was_truncated:
-        return 0
+    if not missing and not idx_was_torn and not raw_was_torn and idx_exists:
+        return RepairOutcome(raw_frames_kept=len(raw_lines))
+
+    quarantined: list[Path] = []
+    if raw_was_torn:
+        quarantined.append(_quarantine_file(raw_path))
+    if idx_exists:
+        quarantined.append(_quarantine_file(idx_path))
 
     for n in missing:
         entry_line_by_n[n] = encode_index_entry(IndexEntry(
             n=n, t_recv_ns=0, t_exch_ms=None, seq=None, kind="recovered", esc=False))
+
+    # Raw first: if the process dies between the two writes, the index is the
+    # file repair can rebuild and the raw file is the one it cannot.
+    if raw_was_torn:
+        _write_lines(raw_path, raw_lines)
     _write_lines(idx_path, [entry_line_by_n[n] for n in range(len(raw_lines))])
-    return len(missing)
+
+    # "Repaired" must mean "a writer can resume", not "the tool ran". This is the
+    # same check `_open` makes, so passing it here is the property that makes
+    # refuse -> repair -> resume terminate.
+    RawWriter._count_frames_already_written(raw_path, idx_path)
+
+    return RepairOutcome(
+        entries_rebuilt=len(missing),
+        entries_discarded=entries_discarded,
+        raw_frames_kept=len(raw_lines),
+        raw_was_salvaged=raw_was_torn,
+        quarantined_paths=tuple(quarantined),
+    )

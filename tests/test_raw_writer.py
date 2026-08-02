@@ -209,7 +209,7 @@ def test_frame_after_a_failed_idx_write_keeps_its_own_receipt_time(tmp_path: Pat
     with pytest.raises(PairLengthMismatch):
         read_pair(raw, idx)
 
-    assert reconcile_pair(raw, idx) == 1
+    assert reconcile_pair(raw, idx).entries_rebuilt == 1
 
     pairs = read_pair(raw, idx)
     assert [p[0] for p in pairs] == ['{"frame":0}', '{"frame":1}', '{"frame":2}']
