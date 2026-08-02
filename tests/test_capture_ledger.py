@@ -5,6 +5,67 @@ from capture.capture_ledger import (
 )
 
 
+def _record_events(root: Path, venue: str, count: int) -> None:
+    ledger = CaptureLedger(root, venue)
+    for i in range(count):
+        ledger.record(LedgerEvent(
+            ts_ns=1785648600_000_000_000 + i, venue=venue, stream="depth",
+            kind=f"event{i}", severity=SEVERITY_CORRUPTING, detail={"i": i},
+        ))
+    ledger.close()
+
+
+def test_torn_final_line_does_not_lose_the_intact_events(tmp_path: Path):
+    """The ledger is the anomaly record, read during an incident.
+
+    A crash truncates the last line. Parsing the file as one list comprehension
+    made that single torn line fatal for the whole day, so every intact event
+    before it became unreadable at the moment it was needed most.
+    """
+    _record_events(tmp_path, "binance", 5)
+    path = tmp_path / "ledger" / "binance" / "2026-08-02" / "events.ndjson"
+    path.write_bytes(path.read_bytes()[:-10])
+
+    result = read_all(tmp_path, "binance", "2026-08-02")
+
+    assert [e.kind for e in result] == ["event0", "event1", "event2", "event3"]
+    assert len(result.damaged) == 1
+    assert result.damaged[0].line_number == 5
+    assert "event4" in result.damaged[0].text        # the damage is surfaced, not dropped
+    assert result.damaged[0].error
+
+
+def test_a_torn_line_in_the_middle_keeps_the_events_around_it(tmp_path: Path):
+    _record_events(tmp_path, "binance", 4)
+    path = tmp_path / "ledger" / "binance" / "2026-08-02" / "events.ndjson"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1][: len(lines[1]) // 2]        # torn line, not last
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = read_all(tmp_path, "binance", "2026-08-02")
+    assert [e.kind for e in result] == ["event0", "event2", "event3"]
+    assert [d.line_number for d in result.damaged] == [2]
+
+
+def test_a_line_that_is_json_but_not_an_event_is_reported_damaged(tmp_path: Path):
+    _record_events(tmp_path, "binance", 1)
+    path = tmp_path / "ledger" / "binance" / "2026-08-02" / "events.ndjson"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write('{"not":"an event"}\n')
+
+    result = read_all(tmp_path, "binance", "2026-08-02")
+    assert len(result) == 1
+    assert [d.line_number for d in result.damaged] == [2]
+
+
+def test_an_intact_ledger_reports_no_damage(tmp_path: Path):
+    _record_events(tmp_path, "binance", 3)
+    result = read_all(tmp_path, "binance", "2026-08-02")
+    assert len(result) == 3
+    assert result.damaged == []
+    assert result.events == list(result)
+
+
 def test_records_and_reads_back(tmp_path: Path):
     ledger = CaptureLedger(tmp_path, "binance")
     ledger.record(LedgerEvent(

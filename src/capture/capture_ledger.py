@@ -57,9 +57,58 @@ class CaptureLedger:
             self._date = None
 
 
-def read_all(root: Path, venue: str, date: str) -> list[LedgerEvent]:
+@dataclass(frozen=True)
+class DamagedLedgerLine:
+    """A ledger line that could not be turned back into an event."""
+    line_number: int
+    text: str
+    error: str
+
+
+class LedgerReadResult(list):
+    """The intact events, carrying the lines that could not be parsed.
+
+    Subclasses `list` so it reads exactly like the event list callers already
+    iterate and `len()`, while `damaged` makes the unparseable lines reachable
+    instead of either lost or fatal.
+    """
+
+    def __init__(self, events: list[LedgerEvent], damaged: list[DamagedLedgerLine]) -> None:
+        super().__init__(events)
+        self.damaged = damaged
+
+    @property
+    def events(self) -> list[LedgerEvent]:
+        return list(self)
+
+
+def read_all(root: Path, venue: str, date: str) -> LedgerReadResult:
+    """Read a day's events, keeping the intact ones when a line is damaged.
+
+    The ledger is the anomaly record - the last line of defence during an
+    incident - and its final line is the one a crash truncates. Parsing the file
+    as a single list comprehension made one torn line fatal for the whole day:
+    every intact event before it became unreadable at the exact moment it was
+    needed. Damaged lines are collected on the result instead, so they are
+    surfaced rather than silently skipped or allowed to destroy the rest.
+    """
     path = _path_for(root, venue, date)
+    events: list[LedgerEvent] = []
+    damaged: list[DamagedLedgerLine] = []
     if not path.exists():
-        return []
+        return LedgerReadResult(events, damaged)
     with open(path, encoding="utf-8") as fh:
-        return [LedgerEvent(**json.loads(line)) for line in fh if line.strip()]
+        for line_number, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            try:
+                # ValueError covers json.JSONDecodeError; TypeError covers a line
+                # that is valid JSON but not a LedgerEvent's fields.
+                events.append(LedgerEvent(**json.loads(line)))
+            except (ValueError, TypeError) as exc:
+                damaged.append(DamagedLedgerLine(
+                    line_number=line_number,
+                    text=line.rstrip("\n"),
+                    error=f"{type(exc).__name__}: {exc}",
+                ))
+    return LedgerReadResult(events, damaged)
