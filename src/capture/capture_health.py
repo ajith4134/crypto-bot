@@ -25,6 +25,12 @@ recorded for the same venue, date and severity band is not repeated (see
 but never alerted on. Only conditions that change the operator's decision get
 a line.
 
+A `silent_stream` event carries the same `observation_loss` severity and is
+nevertheless alerted on, because it is not a gap in a working stream - it is a
+stream that delivered nothing at all. That is the failure which produced an
+archive holding order book and no trades, funding or liquidations, and it is
+raised at most once per magnitude of the count, like every other counted alert.
+
 Absence is treated as a failure, not as health. A venue-day that captured
 nothing at all reports `capture_status="absent"` and alerts, because "no gaps
 recorded" is exactly what a stream that never connected also looks like.
@@ -203,6 +209,12 @@ def build_report(root: Path, venue: str, date: str,
 
     gaps = {"corrupting": 0, "observation_loss": 0, "info": 0}
     corrupting_non_gap = 0
+    # Streams the recorder subscribed to and heard nothing from. Counted apart
+    # from gaps: a gap is a hole in a stream that is working, this is a stream
+    # that is not. Deliberately not folded into `gaps[observation_loss]`, which
+    # is the routine bucket that is never alerted on.
+    silent_streams = 0
+    silent_stream_names: set[str] = set()
     for event in events:
         # A ledger line can be valid JSON and still carry a mistyped severity,
         # which `read_all` has no reason to reject. Bucketing it keeps one odd
@@ -211,6 +223,10 @@ def build_report(root: Path, venue: str, date: str,
         severity = event.severity if isinstance(event.severity, str) else "unknown"
         if event.kind == "gap":
             gaps[severity] = gaps.get(severity, 0) + 1
+        elif event.kind == "silent_stream":
+            silent_streams += 1
+            if isinstance(event.stream, str):
+                silent_stream_names.add(event.stream)
         elif severity == SEVERITY_CORRUPTING:
             # `unwritable_stream_total` is the worst thing in the ledger - a
             # stream being dropped entirely - and it is not a gap.
@@ -237,6 +253,8 @@ def build_report(root: Path, venue: str, date: str,
         "damaged_ledger_lines": len(events.damaged),
         "gaps": gaps,
         "corrupting_non_gap": corrupting_non_gap,
+        "silent_streams": silent_streams,
+        "silent_stream_names": sorted(silent_stream_names),
         "raw_data_bytes": raw_data_bytes,
         "capture_status": capture_status,
         "free_bytes": free_bytes,
@@ -289,6 +307,15 @@ def _build_alerts(report: dict) -> list[dict]:
     if report.get("corrupting_non_gap", 0) > 0:
         count = report["corrupting_non_gap"]
         add("corrupting_non_gap_events", str(_order_of_magnitude(count)), count=count)
+    if report.get("silent_streams", 0) > 0:
+        # Not a routine observation_loss: a subscribed stream delivering nothing
+        # changes what the operator does, and it is the failure that produced an
+        # archive of order book with no trades, funding or liquidations in it.
+        # The names travel with the alert so the file answers "which ones?"
+        # without anyone opening the ledger.
+        count = report["silent_streams"]
+        add("silent_streams", str(_order_of_magnitude(count)), count=count,
+            streams=report.get("silent_stream_names", []))
     if report.get("damaged_ledger_lines", 0) > 0:
         count = report["damaged_ledger_lines"]
         add("ledger_damaged", str(_order_of_magnitude(count)), count=count)

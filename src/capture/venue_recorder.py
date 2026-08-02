@@ -16,7 +16,7 @@ from capture.capture_ledger import (
     SEVERITY_OBSERVATION_LOSS,
 )
 from capture.raw_writer import RawCaptureError, RawWriter
-from capture.sequencing import BinanceDepthTracker, HyperliquidStalenessTracker
+from capture.sequencing import BinanceDepthTracker, StalenessTracker
 
 # stream/symbol come from `extract()`, which reads them out of the wire
 # payload (event name, "s"/"coin" fields, ...). They end up as filename
@@ -26,6 +26,11 @@ from capture.sequencing import BinanceDepthTracker, HyperliquidStalenessTracker
 # Anything that isn't a plain token falls back to "unknown", the same bucket
 # already used for frames whose routing fields could not be determined.
 _SAFE_PATH_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+# How many times its own widest observed gap a stream may go quiet before the
+# silence is reported. The same multiple `StalenessTracker` uses to tell an
+# outage from ordinary slowness, for the same reason.
+_SILENCE_STALL_MULTIPLE = 3.0
 
 
 def _safe_path_token(value: str) -> str:
@@ -56,7 +61,14 @@ class VenueRecorder:
         }
         self._session_start_ns = clock_ns()
         self._silence_grace_ns = int(silence_grace_seconds * 1e9)
-        self._silent_streams_recorded = False
+        # Per stream: when it last spoke, how many frames it has sent, and the
+        # widest gap it has shown - the evidence `_record_silent_streams` judges
+        # silence against. `_recorded_silent_streams` keeps that to one event
+        # per stream per session.
+        self._last_frame_ns: dict[tuple[str, str], int] = {}
+        self._frames_seen: dict[tuple[str, str], int] = {}
+        self._widest_gap_ns: dict[tuple[str, str], int] = {}
+        self._recorded_silent_streams: set[tuple[str, str]] = set()
         self._writers: dict[tuple[str, str], RawWriter] = {}
         self._trackers: dict[tuple[str, str], object] = {}
         # Streams whose hour cannot be written, mapped to how many frames that
@@ -76,14 +88,22 @@ class VenueRecorder:
         return self._writers[key]
 
     def _tracker_for(self, stream: str, symbol: str):
+        """The gap owner for one stream: a sequence chain where one exists,
+        cadence everywhere else.
+
+        Binance depth carries a U/u/pu chain, and a break in it corrupts the
+        book, so that is what is checked (spec 5.4). Every other stream carries
+        no sequence at all, and used to get no tracker whatsoever - `trade`,
+        `markPrice` and `forceOrder` had no staleness owner, so a stream that
+        slowed to a crawl was invisible. `StalenessTracker` works from receipt
+        times alone, so it owns all of them.
+        """
         key = (stream.casefold(), symbol.casefold())
         if key not in self._trackers:
             if self._venue.name == "binance" and stream == "depth":
                 self._trackers[key] = BinanceDepthTracker()
-            elif self._venue.name == "hyperliquid" and stream == "l2Book":
-                self._trackers[key] = HyperliquidStalenessTracker()
             else:
-                self._trackers[key] = None
+                self._trackers[key] = StalenessTracker()
         return self._trackers[key]
 
     def _append_or_quarantine_stream(self, stream: str, symbol: str, payload: str,
@@ -110,6 +130,10 @@ class VenueRecorder:
         per-stream would spin instead of surfacing it.
         """
         key = (stream.casefold(), symbol.casefold())
+        # Liveness is recorded before anything can go wrong with the write: a
+        # stream whose hour is quarantined is still speaking, and reporting it
+        # dead as well would be false.
+        self._note_stream_spoke(key, t_recv_ns)
         if key in self._unwritable_streams:
             self._unwritable_streams[key] += 1
             self._stats["unwritable"] += 1
@@ -146,43 +170,77 @@ class VenueRecorder:
                 detail={"symbol": symbol, "frames_lost": lost},
             ))
 
+    def _note_stream_spoke(self, key: tuple[str, str], t_recv_ns: int) -> None:
+        """Remember that this stream is alive, and how far apart its frames come.
+
+        The widest gap is what `_record_silent_streams` judges silence against,
+        and it is kept here rather than taken from a `StalenessTracker` because
+        that tracker cannot supply it for the streams that need it most: a
+        stream whose ordinary cadence exceeds `stall_multiple` x its floor never
+        learns a baseline at all, so its threshold stays pinned at a few seconds
+        forever (see the learning-rule note in `sequencing.StalenessTracker`).
+        Judging a liquidation feed by that would report it dead every session.
+        """
+        last = self._last_frame_ns.get(key)
+        if last is not None:
+            self._widest_gap_ns[key] = max(self._widest_gap_ns.get(key, 0),
+                                           t_recv_ns - last)
+        self._last_frame_ns[key] = t_recv_ns
+        self._frames_seen[key] = self._frames_seen.get(key, 0) + 1
+
     def _record_silent_streams(self, now_ns: int) -> None:
-        """Record every subscribed stream that has not produced a single frame.
+        """Record every subscribed stream that is not producing frames.
 
-        A stream that was asked for and never answered is invisible: no file is
-        created, so it looks exactly like a healthy stream in a quiet market -
-        an empty directory nobody notices. This is not hypothetical. Measured
-        against Binance on 2026-08-02, `aggTrade`, `markPrice@1s` and
-        `forceOrder` delivered zero frames over the websocket while `depth`
-        flowed normally, and nothing in the capture said so.
+        Two conditions, one event, because they are indistinguishable on disk
+        and identical to an operator: a stream that never answered at all, and a
+        stream that answered and then died. Neither leaves anything to notice -
+        the first creates no file, the second leaves a file that simply stops
+        growing, which looks exactly like a healthy stream in a quiet market.
+        Both are measured facts here: on 2026-08-02 Binance delivered zero
+        `aggTrade`, `markPrice@1s` and `forceOrder` frames while `depth` flowed,
+        and an earlier version of this check excluded any stream the moment it
+        produced one frame - so a stream that died mid-session was invisible.
 
-        The claim made here is narrow and exact: *nothing arrived on this stream
-        in the first `silence_grace_seconds` of the session*. Every stream is
-        silent at startup, so the grace period is what stops this firing on
-        every start. A stream that spoke and then stopped is a different
-        condition with a different owner - the staleness and gap trackers.
+        Nothing frame-driven can catch the second condition. A dead stream sends
+        no frame, so its tracker never runs; only the venue clock, ticking on
+        every other stream's frames and again at close, can ask on its behalf.
+        That is why this is not delegated to the gap trackers - and the trackers
+        genuinely do not own it, which the previous version of this docstring
+        wrongly claimed they did.
 
-        Recorded at most once per session: `consume` keeps calling this as
+        How long is too long is per stream, and never shorter than the grace
+        period. A stream that has shown its cadence is judged against
+        `_SILENCE_STALL_MULTIPLE` x the widest gap it has actually produced, so
+        a liquidation feed minutes between frames is not called dead while a
+        100ms depth stream is. A stream that has shown nothing (never spoke, or
+        spoke exactly once) has only the grace period to go on.
+
+        Recorded at most once per stream per session: `consume` calls this as
         frames arrive and `close` calls it again, and an event per frame would
-        drown the ledger in the anomaly it exists to surface.
+        drown the ledger in the anomaly it exists to surface. A stream that
+        recovers is deliberately not re-armed - it already had its incident.
 
         Severity is observation loss, not corruption: what was captured is
         intact, there is simply less of it than was asked for.
         """
-        if self._silent_streams_recorded:
-            return
-        if now_ns - self._session_start_ns < self._silence_grace_ns:
-            return
-        self._silent_streams_recorded = True
         for key, (stream, symbol) in self._expected_streams.items():
-            if key in self._writers:
+            if key in self._recorded_silent_streams:
                 continue
+            last_ns = self._last_frame_ns.get(key, self._session_start_ns)
+            quiet_ns = now_ns - last_ns
+            threshold_ns = max(
+                self._silence_grace_ns,
+                int(_SILENCE_STALL_MULTIPLE * self._widest_gap_ns.get(key, 0)))
+            if quiet_ns < threshold_ns:
+                continue
+            self._recorded_silent_streams.add(key)
             self._ledger.record(LedgerEvent(
                 ts_ns=now_ns, venue=self._venue.name, stream=stream,
                 kind="silent_stream", severity=SEVERITY_OBSERVATION_LOSS,
-                detail={"symbol": symbol, "frames_received": 0,
-                        "silent_for_seconds": round(
-                            (now_ns - self._session_start_ns) / 1e9, 3)},
+                detail={"symbol": symbol,
+                        "frames_received": self._frames_seen.get(key, 0),
+                        "silent_for_seconds": round(quiet_ns / 1e9, 3),
+                        "threshold_seconds": round(threshold_ns / 1e9, 3)},
             ))
 
     def _record_gap(self, stream: str, symbol: str, report, t_recv_ns: int) -> None:
@@ -238,8 +296,19 @@ class VenueRecorder:
         tracker = self._tracker_for(stream, symbol)
         if tracker is not None and meta.kind == "data":
             body = parsed.get("data", parsed)
-            report = (tracker.check(body) if isinstance(tracker, BinanceDepthTracker)
-                      else tracker.check(t_recv_ns))
+            if isinstance(tracker, BinanceDepthTracker):
+                report = tracker.check(body)
+            else:
+                report = tracker.check(t_recv_ns)
+                # Before a baseline exists, a staleness report says only that
+                # the gap beat a fixed floor - it has not been compared against
+                # this stream at all. For a stream whose ordinary cadence is
+                # slower than that floor, and which can therefore never acquire
+                # a baseline, that is a ledger event on every frame it will ever
+                # receive. Whether such a stream has died is answered by
+                # `_record_silent_streams` from the venue clock instead.
+                if not tracker.has_baseline():
+                    report = None
             if report is not None:
                 self._record_gap(stream, symbol, report, t_recv_ns)
 

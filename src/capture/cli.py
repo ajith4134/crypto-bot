@@ -68,9 +68,17 @@ async def _stream_frames(venue, specs, duration_seconds: float) -> AsyncIterator
                 return
 
 
-async def run_capture(venue, specs, root: Path, duration_seconds: float) -> dict:
-    """Record one venue for `duration_seconds` and report what was captured."""
-    recorder = VenueRecorder(venue, specs, root)
+async def run_capture(venue, specs, root: Path, duration_seconds: float,
+                      silence_grace_seconds: float = 60.0) -> dict:
+    """Record one venue for `duration_seconds` and report what was captured.
+
+    `silence_grace_seconds` is how long a subscribed stream may deliver nothing
+    before the recorder writes that fact to the ledger. It is exposed because a
+    run shorter than the grace can never report a silent stream, which makes a
+    short capture look clean when it is not.
+    """
+    recorder = VenueRecorder(venue, specs, root,
+                             silence_grace_seconds=silence_grace_seconds)
     frames = _stream_frames(venue, specs, duration_seconds)
     # `aclosing` matters on the failure path: if consume() raises, the async
     # generator is left suspended inside its `async with websockets.connect(...)`
@@ -90,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=str(Path.home() / "capture"))
     parser.add_argument("--seconds", type=float, default=0.0,
                         help="0 means run until interrupted")
+    parser.add_argument("--silence-grace-seconds", type=float, default=60.0,
+                        help="how long a subscribed stream may deliver nothing "
+                             "before that is recorded in the ledger")
     args = parser.parse_args(argv)
 
     # A symbol carrying whitespace builds a channel name the venue does not
@@ -107,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
     duration = args.seconds if args.seconds > 0 else float("inf")
 
     try:
-        stats = asyncio.run(run_capture(venue, specs, Path(args.root), duration))
+        stats = asyncio.run(run_capture(venue, specs, Path(args.root), duration,
+                                        args.silence_grace_seconds))
     except KeyboardInterrupt:
         # asyncio.run cancels the capture before re-raising, which unwinds
         # VenueRecorder.consume through its own `finally` and flushes every

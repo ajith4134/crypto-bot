@@ -423,3 +423,72 @@ def test_alerts_are_appended_not_rewritten(tmp_path: Path):
         report = build_report(tmp_path, venue, DATE, free_bytes=BIG, daily_bytes=DAILY)
         write_alerts(tmp_path, report)
     assert [alert["venue"] for alert in _alert_lines(tmp_path)] == ["binance", "bybit"]
+
+
+def test_silent_streams_are_counted_and_named_in_the_report(tmp_path: Path):
+    """A subscribed stream producing nothing is the failure that started this:
+    the archive holds order book and nothing else, and every check that reads
+    only file sizes and gap counts calls that healthy. It has to be in the
+    report an operator actually opens, not only in the ledger."""
+    ledger = CaptureLedger(tmp_path, "binance")
+    for stream, symbol in (("markPrice", "BTCUSDT"), ("forceOrder", "BTCUSDT"),
+                           ("markPrice", "ETHUSDT")):
+        ledger.record(LedgerEvent(TS, "binance", stream, "silent_stream",
+                                  SEVERITY_OBSERVATION_LOSS,
+                                  {"symbol": symbol, "frames_received": 0}))
+    ledger.record(LedgerEvent(TS, "binance", "depth", "gap",
+                              SEVERITY_OBSERVATION_LOSS, {}))
+    ledger.close()
+    _write_capture_file(tmp_path, "binance", DATE, size=1000)
+
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+
+    assert report["silent_streams"] == 3
+    assert report["silent_stream_names"] == ["forceOrder", "markPrice"]
+    # a silent stream is not a gap, and must not be counted as one
+    assert report["gaps"] == {"corrupting": 0, "observation_loss": 1, "info": 0}
+    assert report["corrupting_non_gap"] == 0
+
+
+def test_a_silent_stream_raises_an_alert(tmp_path: Path):
+    """Unlike a routine observation_loss gap, this one changes what the operator
+    does: a stream is delivering nothing at all."""
+    ledger = CaptureLedger(tmp_path, "binance")
+    ledger.record(LedgerEvent(TS, "binance", "markPrice", "silent_stream",
+                              SEVERITY_OBSERVATION_LOSS, {"symbol": "BTCUSDT"}))
+    ledger.close()
+    _write_capture_file(tmp_path, "binance", DATE, size=1000)
+
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+    assert write_alerts(tmp_path, report) == 1
+
+    alert = next(a for a in _alert_lines(tmp_path) if a["reason"] == "silent_streams")
+    assert alert["count"] == 1
+    assert alert["streams"] == ["markPrice"]
+
+
+def test_the_same_silent_streams_do_not_alert_twice(tmp_path: Path):
+    """A health report runs on a schedule and the streams stay silent. One line
+    per run is how the alert file becomes unread."""
+    ledger = CaptureLedger(tmp_path, "binance")
+    ledger.record(LedgerEvent(TS, "binance", "markPrice", "silent_stream",
+                              SEVERITY_OBSERVATION_LOSS, {"symbol": "BTCUSDT"}))
+    ledger.close()
+    _write_capture_file(tmp_path, "binance", DATE, size=1000)
+
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+    assert write_alerts(tmp_path, report) == 1
+    assert write_alerts(tmp_path, report) == 0
+    assert _reasons(tmp_path) == ["silent_streams"]
+
+
+def test_ten_times_as_many_silent_streams_is_a_new_alert(tmp_path: Path):
+    """Repeats collapse, a tenfold worsening does not - the same rule the other
+    counted alerts use."""
+    _write_capture_file(tmp_path, "binance", DATE, size=1000)
+    report = build_report(tmp_path, "binance", DATE, free_bytes=BIG, daily_bytes=DAILY)
+
+    write_alerts(tmp_path, dict(report, silent_streams=1, silent_stream_names=["a"]))
+    write_alerts(tmp_path, dict(report, silent_streams=12, silent_stream_names=["a"]))
+
+    assert _reasons(tmp_path) == ["silent_streams", "silent_streams"]

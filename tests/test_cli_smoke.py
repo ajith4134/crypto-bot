@@ -23,6 +23,7 @@ import pytest
 
 from capture import cli
 from capture.cli import main, run_capture
+from capture.capture_ledger import read_all
 from capture.raw_writer import hour_key, paths_for, read_pair
 from capture.venues.binance import BinanceVenue
 from capture.venues.hyperliquid import HyperliquidVenue
@@ -356,9 +357,11 @@ def record_run_capture_calls(monkeypatch, stats: dict | None = None) -> list[dic
     """Replace run_capture with a recorder of how main called it."""
     calls: list[dict] = []
 
-    async def record_call(venue, specs, root, duration_seconds):
+    async def record_call(venue, specs, root, duration_seconds,
+                          silence_grace_seconds=60.0):
         calls.append({"venue": venue, "specs": specs, "root": root,
-                      "duration_seconds": duration_seconds})
+                      "duration_seconds": duration_seconds,
+                      "silence_grace_seconds": silence_grace_seconds})
         return stats if stats is not None else {"written": 0}
 
     monkeypatch.setattr(cli, "run_capture", record_call)
@@ -436,7 +439,8 @@ def test_main_refuses_a_negative_duration(tmp_path: Path, monkeypatch):
 def test_main_exits_on_interrupt_without_a_traceback(tmp_path: Path, monkeypatch):
     """Ctrl-C is how the run-until-interrupted mode is meant to end. asyncio
     cancels the capture (flushing it) and re-raises KeyboardInterrupt here."""
-    async def interrupt_the_capture(venue, specs, root, duration_seconds):
+    async def interrupt_the_capture(venue, specs, root, duration_seconds,
+                                    silence_grace_seconds=60.0):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "run_capture", interrupt_the_capture)
@@ -452,3 +456,37 @@ def test_main_refuses_an_unknown_venue(tmp_path: Path, monkeypatch):
         main(["--venue", "coinbase", "--symbols", "BTCUSDT", "--root", str(tmp_path)])
 
     assert exit_info.value.code == 2
+
+
+def test_main_passes_the_silence_grace_through(tmp_path: Path, monkeypatch, capsys):
+    """A short run needs a short grace, or the silence check has nothing to say
+    before the run is over."""
+    calls = record_run_capture_calls(monkeypatch)
+
+    assert main(["--venue", "binance", "--symbols", "BTCUSDT", "--root", str(tmp_path),
+                 "--seconds", "20", "--silence-grace-seconds", "5"]) == 0
+
+    assert calls[0]["silence_grace_seconds"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_run_capture_reports_a_silent_stream_within_the_run(tmp_path: Path,
+                                                                  monkeypatch):
+    """End to end through the real recorder: a venue that delivers only one of
+    its subscribed streams must say so in the ledger by the time it returns."""
+    venue = BinanceVenue()
+    specs = venue.core_specs(["BTCUSDT"])
+    install_fake_socket(monkeypatch, [depth_frame(1), depth_frame(2)])
+
+    await finish_within(run_capture(venue, specs, tmp_path, duration_seconds=0.4,
+                                    silence_grace_seconds=0.05))
+
+    events = read_all(tmp_path, "binance", hour_key(time.time_ns()).split("T")[0])
+    # Streams that delivered nothing at all. `depth` may also appear once the
+    # socket goes quiet at the end of the run - it went quiet for many times the
+    # 50ms grace this test uses - but it is reported with the frames it did
+    # send, which is the distinction that matters to whoever reads this.
+    never_spoke = {e.stream for e in events
+                   if e.kind == "silent_stream" and e.detail["frames_received"] == 0}
+    assert never_spoke == {"trade", "markPrice", "forceOrder"}
+    assert "depth" not in never_spoke

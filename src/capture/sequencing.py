@@ -49,8 +49,14 @@ class BinanceDepthTracker:
                          {"expected_U": last_u + 1, "got_U": first_id})
 
 
-class HyperliquidStalenessTracker:
-    """No sequence numbers exist, so cadence is learned and stalls are inferred.
+class StalenessTracker:
+    """Learns a stream's cadence and infers a stall from it. Venue-agnostic.
+
+    Written for Hyperliquid l2Book, which carries no sequence numbers, and named
+    for it until 2026-08-02. It works from `t_recv_ns` alone, so it now owns
+    cadence for every stream that has no sequence chain to check - Binance
+    `trade`, `markPrice` and `forceOrder` included, which had no staleness owner
+    at all and so could die mid-session unnoticed.
 
     The threshold is the widest of three terms, and each answers a different
     question. Getting any one of them wrong reintroduces the alarm storm this
@@ -89,6 +95,15 @@ class HyperliquidStalenessTracker:
     floor (an illiquid l2Book updating every 8s against a 5s floor) learns its
     cadence because an 8s gap is nowhere near 3x the 5s floor, so it is learned
     despite being flagged.
+
+    That headroom is bounded, and the bound is the limit of what this class can
+    honestly claim: a stream whose ordinary cadence exceeds `stall_multiple` x
+    `floor_seconds` (15s by default) never learns a baseline at all, and flags
+    every frame forever. See the note on the learning rule in `check`, and
+    `test_a_stream_slower_than_the_stall_rule_never_learns_a_baseline`. Whether
+    a stream has *died* is therefore not a question for this class - a dead
+    stream sends no frame for `check` to run on - and `VenueRecorder` answers it
+    from the venue clock instead.
     """
 
     def __init__(self, floor_seconds: float = 5.0, multiple: float = 10.0,
@@ -148,6 +163,16 @@ class HyperliquidStalenessTracker:
         # A flagged gap is still learned from: it may be evidence the baseline is
         # wrong rather than evidence the stream is sick. Only a gap far beyond
         # the threshold is treated as a stall and kept out of the window.
+        #
+        # Note the consequence, which is deliberate: a stream whose true cadence
+        # is slower than `stall_multiple` x floor (180s against a 5s floor - a
+        # liquidation feed) can never learn a baseline, because its ordinary
+        # cadence is indistinguishable from a stall on the evidence available.
+        # Learning those gaps instead was tried on 2026-08-02 and is worse: six
+        # genuine 60s stalls during warmup then set the routine ceiling and hid
+        # every later stall (see test_hyperliquid_stalls_do_not_poison_median).
+        # `VenueRecorder` handles the slow-stream case from the venue clock
+        # instead, and does not ask this tracker a question it cannot answer.
         if gap <= self._stall_multiple * threshold:
             self._gaps.append(gap)
 

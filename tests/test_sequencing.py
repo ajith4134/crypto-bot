@@ -1,6 +1,6 @@
 import random
 
-from capture.sequencing import BinanceDepthTracker, HyperliquidStalenessTracker
+from capture.sequencing import BinanceDepthTracker, StalenessTracker
 from capture.capture_ledger import SEVERITY_CORRUPTING, SEVERITY_OBSERVATION_LOSS
 
 S = 1_000_000_000  # one second in ns
@@ -18,7 +18,7 @@ def _bursty_gaps_seconds(count: int, seed: int = 7) -> list[float]:
             for _ in range(count)]
 
 
-def _replay_gaps(tracker: HyperliquidStalenessTracker, gaps_seconds: list[float],
+def _replay_gaps(tracker: StalenessTracker, gaps_seconds: list[float],
                  start_ns: int = 1785648600 * S) -> tuple[list, int]:
     now = start_ns
     tracker.check(now)
@@ -60,7 +60,7 @@ def test_binance_spot_without_pu_uses_u_chain():
 
 
 def test_hyperliquid_learns_cadence_then_flags_stall():
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     base = 1785648600 * S
     for i in range(20):
         assert t.check(base + i * S) is None          # steady 1s cadence
@@ -71,7 +71,7 @@ def test_hyperliquid_learns_cadence_then_flags_stall():
 
 
 def test_hyperliquid_floor_prevents_false_alarm_on_fast_streams():
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     base = 1785648600 * S
     for i in range(20):
         t.check(base + int(i * 0.01 * S))             # 10ms cadence
@@ -91,7 +91,7 @@ def test_binance_malformed_message_does_not_disarm_detection():
 
 def test_hyperliquid_long_gap_during_warmup_is_detected():
     """A long gap as the second interval should be detected, not absorbed."""
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     base = 1785648600 * S
     t.check(base)  # First timestamp
     # 500s gap as the very next interval (well above floor)
@@ -110,7 +110,7 @@ def test_hyperliquid_stream_slower_than_the_floor_learns_its_cadence():
     worse, makes a genuine outage arrive with the same severity and shape as the
     hundreds of false ones around it.
     """
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     base = 1785648600 * S
     cadence_seconds = 8
 
@@ -124,7 +124,7 @@ def test_hyperliquid_stream_slower_than_the_floor_learns_its_cadence():
 
 def test_hyperliquid_slow_stream_still_flags_a_real_outage():
     """Learning a slow cadence must not cost the detection it exists for."""
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     base = 1785648600 * S
     for i in range(200):
         t.check(base + i * 8 * S)
@@ -140,7 +140,7 @@ def test_hyperliquid_slow_stream_still_flags_a_real_outage():
 
 def test_hyperliquid_stalls_do_not_poison_median():
     """Stalls should not be included in the cadence learning window."""
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     base = 1785648600 * S
 
     # Start with first timestamp
@@ -177,7 +177,7 @@ def test_bursty_healthy_stream_does_not_alarm_forever():
     That is the same failure the slow-stream fix exists to prevent - a genuine
     outage arriving with the same severity and shape as hundreds of false ones.
     """
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     reports, _ = _replay_gaps(t, _bursty_gaps_seconds(600))
 
     per_hundred = [sum(r is not None for r in reports[i:i + 100])
@@ -191,7 +191,7 @@ def test_bursty_healthy_stream_does_not_alarm_forever():
 
 def test_bursty_stream_still_flags_a_real_outage():
     """Tolerating the burst must not cost the detection the tracker exists for."""
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     _, now = _replay_gaps(t, _bursty_gaps_seconds(600))
 
     report = t.check(now + 30 * 60 * S)
@@ -208,7 +208,7 @@ def test_a_stall_far_beyond_the_threshold_stays_out_of_the_window():
     Without this, a real 10-minute outage would widen the threshold and teach the
     tracker to ignore the next one.
     """
-    t = HyperliquidStalenessTracker(floor_seconds=5.0, multiple=10.0)
+    t = StalenessTracker(floor_seconds=5.0, multiple=10.0)
     _, now = _replay_gaps(t, [1.0] * 199)
     widest_before = max(t._gaps)
 
@@ -219,3 +219,24 @@ def test_a_stall_far_beyond_the_threshold_stays_out_of_the_window():
     report = t.check(now + 600 * S + 600 * S)
     assert report is not None
     assert report.detail["threshold_seconds"] <= 10.0
+
+
+def test_a_stream_slower_than_the_stall_rule_never_learns_a_baseline():
+    """The documented limit of this tracker, and the reason `VenueRecorder` does
+    not ask it whether a stream has died.
+
+    A liquidation feed at one frame every few minutes is indistinguishable from
+    a stalling 1s stream on the evidence available here: gaps beyond
+    `stall_multiple` x the threshold are kept out of the window, and before a
+    baseline the threshold is only the floor - so nothing is ever learned and
+    every frame is flagged. Learning them instead poisons the baseline with
+    warmup stalls (test_hyperliquid_stalls_do_not_poison_median). The recorder
+    therefore judges silence from the venue clock and the widest gap a stream
+    has actually shown, and records a gap event from this tracker only once it
+    has a baseline to speak from.
+    """
+    t = StalenessTracker(floor_seconds=5.0, min_samples=10, stall_multiple=3.0)
+    reports, _ = _replay_gaps(t, [180.0] * 40)
+
+    assert not t.has_baseline()
+    assert all(r is not None for r in reports)

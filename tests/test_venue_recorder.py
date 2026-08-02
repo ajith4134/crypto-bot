@@ -1,4 +1,5 @@
 import json
+import random
 from pathlib import Path
 
 import pytest
@@ -428,3 +429,148 @@ async def test_silence_is_reported_during_the_run_not_only_at_shutdown(tmp_path:
     await rec.consume(frames_and_a_look_at_the_ledger())
 
     assert {e.stream for e in recorded_mid_run} == {"trade", "markPrice", "forceOrder"}
+
+
+def gap_events(root: Path) -> list:
+    return [e for e in read_all(root, "binance", "2026-08-02") if e.kind == "gap"]
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_speaks_once_and_then_dies_reaches_the_ledger(tmp_path: Path):
+    """The condition the first version of this check could not see: `trade`
+    fires once, and is thereafter permanently excluded from the silence check
+    because it has a writer. A 24/7 recorder would never notice it died.
+
+    Nothing frame-driven can catch this - a dead stream sends no frame for a
+    tracker to run on - so the venue clock has to ask on its behalf.
+    """
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                    5_000_000_000))
+
+    await rec.consume(_frames(
+        [json.dumps({"data": {"e": "trade", "E": 1, "s": "BTCUSDT", "t": 1}})]
+        + [_depth_frame("BTCUSDT", i) for i in range(1, 40)]))
+
+    dead = [e for e in silent_stream_events(tmp_path) if e.stream == "trade"]
+    assert len(dead) == 1
+    assert dead[0].detail["frames_received"] == 1        # it spoke, then died
+    assert dead[0].detail["silent_for_seconds"] >= 60
+    assert dead[0].severity == SEVERITY_OBSERVATION_LOSS
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_bursty_trade_stream_does_not_alarm(tmp_path: Path):
+    """Trades arrive in bursts with quiet stretches between them. An earlier
+    round of this project turned exactly that shape into an alarm on 57% of
+    frames; a silence check that repeats the mistake is worse than none."""
+    venue = BinanceVenue()
+    rng = random.Random(7)
+    gaps_ns = [int((6.0 if rng.random() < 0.6 else 0.5) * 1e9) for _ in range(300)]
+    # One tick at construction, one per frame, one when close() checks silence.
+    ticks = [1785648600_000_000_000]
+    for gap in gaps_ns + [1_000_000_000] * 3:
+        ticks.append(ticks[-1] + gap)
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60, clock_ns=iter(ticks).__next__)
+
+    await rec.consume(_frames([
+        json.dumps({"data": {"e": "trade", "E": i, "s": "BTCUSDT", "t": i}})
+        for i in range(len(gaps_ns))]))
+
+    assert [e for e in silent_stream_events(tmp_path) if e.stream == "trade"] == []
+    trade_gaps = [e for e in gap_events(tmp_path) if e.stream == "trade"]
+    assert len(trade_gaps) <= len(gaps_ns) * 0.05, (
+        f"{len(trade_gaps)} alarms on {len(gaps_ns)} healthy bursty frames")
+
+
+@pytest.mark.asyncio
+async def test_a_sparse_stream_is_judged_against_its_own_cadence(tmp_path: Path):
+    """Liquidations arrive minutes apart. Judging that against the grace period
+    would report a dead stream on a healthy one every session."""
+    venue = BinanceVenue()
+    every_180s = [1785648600_000_000_000 + i * 180_000_000_000 for i in range(6)]
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=iter(every_180s + [every_180s[-1]]).__next__)
+
+    await rec.consume(_frames([
+        json.dumps({"data": {"e": "forceOrder", "E": i,
+                             "o": {"s": "BTCUSDT", "q": "1"}}})
+        for i in range(len(every_180s) - 1)]))
+
+    assert [e for e in silent_stream_events(tmp_path)
+            if e.stream == "forceOrder"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_stream_too_slow_to_learn_a_cadence_does_not_alarm_on_every_frame(
+        tmp_path: Path):
+    """A liquidation feed minutes between frames never builds a baseline (see
+    test_a_stream_slower_than_the_stall_rule_never_learns_a_baseline), so its
+    tracker measures every gap against the 5s floor and flags all of them,
+    forever. One ledger event per frame for the life of the stream is the alarm
+    storm this project has already been bitten by. A staleness report is only
+    worth recording once the tracker has something to compare against; whether
+    such a stream has died is answered by the silence check instead.
+    """
+    venue = BinanceVenue()
+    every_180s = [1785648600_000_000_000 + i * 180_000_000_000 for i in range(9)]
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=iter(every_180s + [every_180s[-1]]).__next__)
+
+    await rec.consume(_frames([
+        json.dumps({"data": {"e": "forceOrder", "E": i,
+                             "o": {"s": "BTCUSDT", "q": "1"}}})
+        for i in range(len(every_180s) - 1)]))
+
+    assert [e for e in gap_events(tmp_path) if e.stream == "forceOrder"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_real_stall_on_a_settled_stream_is_still_recorded(tmp_path: Path):
+    """The other half of that trade-off: once a stream has shown what its
+    cadence is, a stall against it must still reach the ledger."""
+    venue = BinanceVenue()
+    ticks = [1785648600_000_000_000 + i * 1_000_000_000 for i in range(30)]
+    ticks.append(ticks[-1] + 600_000_000_000)          # a 10 minute hole
+    ticks.append(ticks[-1])
+    rec = VenueRecorder(venue, venue.tail_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60, clock_ns=iter(ticks).__next__)
+
+    await rec.consume(_frames([
+        json.dumps({"data": {"e": "trade", "E": i, "s": "BTCUSDT", "t": i}})
+        for i in range(30)]))
+
+    stalls = [e for e in gap_events(tmp_path) if e.stream == "trade"]
+    assert len(stalls) == 1
+    assert stalls[0].severity == SEVERITY_OBSERVATION_LOSS
+    assert stalls[0].detail["gap_seconds"] == 600.0
+
+
+@pytest.mark.asyncio
+async def test_a_quarantined_stream_is_not_also_reported_dead(tmp_path: Path):
+    """A stream whose hour cannot be written is still speaking. Reporting it
+    silent as well would send whoever reads the ledger looking for a venue
+    problem that does not exist - the frames are arriving, they just cannot be
+    stored, which the unwritable events already say."""
+    from capture.raw_writer import paths_for
+
+    venue = BinanceVenue()
+    first = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                          clock_ns=lambda: 1785648600_000_000_000)
+    await first.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(20)]))
+    raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    second = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                           silence_grace_seconds=60,
+                           clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                       5_000_000_000))
+    await second.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(30, 60)]))
+
+    assert second.stats()["unwritable"] == 30
+    assert [e for e in silent_stream_events(tmp_path) if e.stream == "depth"] == []
