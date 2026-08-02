@@ -28,6 +28,12 @@ class BinanceDepthTracker:
     def check(self, parsed: dict) -> GapReport | None:
         first_id, final_id = parsed.get("U"), parsed.get("u")
         prev_final = parsed.get("pu")
+
+        # If u is missing or None, this message is malformed.
+        # Don't touch state, just skip it.
+        if final_id is None:
+            return None
+
         last_u, self._last_u = self._last_u, final_id
         if last_u is None:
             return None
@@ -64,13 +70,24 @@ class HyperliquidStalenessTracker:
             return None
         gap = t_recv_ns - last
         report = None
-        if len(self._gaps) >= 10:
+
+        # Compute threshold from whatever gaps we have, not requiring 10.
+        # With no prior gaps, use floor only. With >= 1 gap, use median * multiple (floored at floor).
+        if len(self._gaps) >= 1:
             threshold = max(self._floor_ns,
                             int(statistics.median(self._gaps) * self._multiple))
-            if gap > threshold:
-                report = GapReport(SEVERITY_OBSERVATION_LOSS, {
-                    "gap_seconds": gap / 1e9,
-                    "threshold_seconds": threshold / 1e9,
-                })
-        self._gaps.append(gap)
+        else:
+            threshold = self._floor_ns
+
+        if gap > threshold:
+            report = GapReport(SEVERITY_OBSERVATION_LOSS, {
+                "gap_seconds": gap / 1e9,
+                "threshold_seconds": threshold / 1e9,
+            })
+
+        # Only append normal cadence to the window, not stalls.
+        # Stalls are anomalies and should not be included in the learning window.
+        if report is None:
+            self._gaps.append(gap)
+
         return report
