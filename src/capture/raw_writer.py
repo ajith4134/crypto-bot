@@ -141,6 +141,28 @@ class RawWriter:
                 self._hour = None
 
 
+def _read_lines(path: Path) -> list[str]:
+    """Split strictly on newline.
+
+    NOT str.splitlines(): that also splits on \v, \f, \x1c-\x1e, \x85,
+    U+2028 and U+2029, none of which escape_payload guards. Such a payload
+    would yield an extra raw line with no matching index entry, and every
+    subsequent line would pair with the wrong entry.
+    """
+    dctx = zstandard.ZstdDecompressor()
+    with open(path, "rb") as fh:
+        text = dctx.stream_reader(fh).read().decode("utf-8")
+    return text.rstrip("\n").split("\n") if text else []
+
+
+def _write_lines(path: Path, lines: list[str]) -> None:
+    cctx = zstandard.ZstdCompressor(level=3)
+    with open(path, "wb") as fh:
+        with cctx.stream_writer(fh) as w:
+            for line in lines:
+                w.write((line + "\n").encode("utf-8"))
+
+
 def read_pair(raw_path: Path, idx_path: Path) -> list[tuple[str, IndexEntry]]:
     dctx = zstandard.ZstdDecompressor()
     with open(raw_path, "rb") as fh:
@@ -161,3 +183,25 @@ def read_pair(raw_path: Path, idx_path: Path) -> list[tuple[str, IndexEntry]]:
         for r, i in zip(raw_lines, idx_lines)
         for entry in [decode_index_entry(i)]
     ]
+
+
+def reconcile_pair(raw_path: Path, idx_path: Path) -> int:
+    """Rebuild index entries for raw lines a crash left undescribed.
+
+    Returns the number of entries repaired. Never discards raw data, and never
+    invents a receipt timestamp - unknown times are recorded as 0 with
+    kind="recovered" so downstream can exclude them explicitly.
+    """
+    raw_lines = _read_lines(raw_path)
+    idx_lines = _read_lines(idx_path)
+    if len(idx_lines) >= len(raw_lines):
+        return 0
+
+    repaired = 0
+    for n in range(len(idx_lines), len(raw_lines)):
+        entry = IndexEntry(n=n, t_recv_ns=0, t_exch_ms=None,
+                           seq=None, kind="recovered", esc=False)
+        idx_lines.append(encode_index_entry(entry))
+        repaired += 1
+    _write_lines(idx_path, idx_lines)
+    return repaired
