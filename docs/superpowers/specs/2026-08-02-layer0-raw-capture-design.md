@@ -287,7 +287,27 @@ Established by direct check on 2026-08-02, not assumed.
 
 ## 10. Blockers and preconditions
 
-### B1 — GCS write access is unproven (blocking for offload only)
+### ~~B1 — GCS write access is unproven~~ → **RESOLVED 2026-08-02**
+
+> **Bucket `gs://capture-raw-data4134` created and `roles/storage.objectAdmin` granted to
+> `1095194309870-compute@developer.gserviceaccount.com`.** Verified end to end by
+> `scripts/verify_gcs_write.sh`, which uploads, reads back, lists, **compares byte-for-byte**, and
+> deletes:
+>
+> ```
+> RESULT: GCS write access CONFIRMED for gs://capture-raw-data4134
+> ```
+>
+> The round-trip comparison is deliberate — a successful upload that silently corrupts is exactly the
+> failure this project exists to avoid, so "the command exited 0" is not accepted as proof.
+>
+> **Consequence: `archive_offloader` is unblocked and may now be built.** The local-only-never-prunes
+> rule below applies only until it exists. The runway table stays relevant as the deadline for
+> building it, not for obtaining access.
+>
+> Original blocker text follows for the record.
+
+### B1 (original) — GCS write access is unproven (blocking for offload only)
 
 ```
 ERROR: HTTPError 403: ...does not have storage.buckets.list access to the project
