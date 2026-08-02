@@ -681,3 +681,160 @@ async def test_a_stream_that_speeds_up_is_judged_on_its_recent_cadence(tmp_path:
     dead = [e for e in silent_stream_events(tmp_path) if e.stream == "trade"]
     assert len(dead) == 1, "judged on a cadence the stream has long outgrown"
     assert dead[0].detail["threshold_seconds"] == 60.0
+
+
+# --------------------------------------------------------------------------
+# CRITICAL - the quarantine is the damaged HOUR, not the stream forever
+# --------------------------------------------------------------------------
+
+HOUR_NS = 3600 * 10**9
+
+
+def clock_from(ticks: list[int]):
+    """A clock over a fixed script that holds its last value forever after.
+
+    `close()` reads the clock an unbounded number of times (once per quarantined
+    hour's total, once for the silence sweep), so a bare iterator turns a missing
+    tick into StopIteration instead of a test failure.
+    """
+    remaining = iter(ticks)
+    state = {"last": ticks[0]}
+
+    def clock_ns() -> int:
+        state["last"] = next(remaining, state["last"])
+        return state["last"]
+
+    return clock_ns
+
+
+@pytest.mark.asyncio
+async def test_a_quarantined_stream_is_re_armed_at_the_next_hour(tmp_path: Path):
+    """`HourFileNotAppendable` names ONE hour's files. The quarantine was keyed
+    per stream for the life of the process, so a single torn hour left behind by
+    a prior crash cost that stream every remaining hour of the run - hours that
+    were undamaged and would have opened cleanly. On a 24/7 recorder that is the
+    whole stream, indefinitely, from one bad byte.
+    """
+    from capture.raw_writer import paths_for, read_pair
+
+    venue = BinanceVenue()
+    first = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                          clock_ns=lambda: 1785648600_000_000_000)
+    await first.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(2)]))
+    raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    t05 = 1785648600_000_000_000
+    second = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                           clock_ns=clock_from([t05, t05, t05 + HOUR_NS,
+                                                t05 + 2 * HOUR_NS]))
+    await second.consume(_frames([_depth_frame("BTCUSDT", i) for i in (9, 10, 11)]))
+
+    # Only the damaged hour is lost; the two clean hours recorded.
+    assert second.stats()["unwritable"] == 1
+    assert second.stats()["written"] == 2
+    for hour in ("2026-08-02T06", "2026-08-02T07"):
+        r, i = paths_for(tmp_path, "binance", "depth", "BTCUSDT", hour)
+        assert r.exists(), f"{hour} was refused although it was undamaged"
+        assert len(read_pair(r, i)) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_cost_of_a_quarantined_hour_reaches_the_ledger_at_rotation(
+        tmp_path: Path):
+    """A `--seconds 0` capture runs for weeks. Reporting the size of the loss
+    only from `close()` means an unattended process never reports it at all, so
+    the count for a quarantined hour is recorded when that hour rotates away.
+    """
+    from capture.raw_writer import paths_for
+
+    venue = BinanceVenue()
+    first = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                          clock_ns=lambda: 1785648600_000_000_000)
+    await first.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(2)]))
+    raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    t05 = 1785648600_000_000_000
+    totals_seen_mid_run = []
+
+    async def frames_then_a_look_at_the_ledger():
+        yield _depth_frame("BTCUSDT", 1)          # T05: refused
+        yield _depth_frame("BTCUSDT", 2)          # T05: refused
+        yield _depth_frame("BTCUSDT", 3)          # T06: rotation drains the total
+        totals_seen_mid_run.extend(
+            e for e in read_all(tmp_path, "binance", "2026-08-02")
+            if e.kind == "unwritable_stream_total")
+
+    second = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                           clock_ns=clock_from([t05, t05, t05, t05 + HOUR_NS]))
+    await second.consume(frames_then_a_look_at_the_ledger())
+
+    assert len(totals_seen_mid_run) == 1, "the loss was invisible until close()"
+    assert totals_seen_mid_run[0].detail["frames_lost"] == 2
+    assert totals_seen_mid_run[0].detail["hour"] == "2026-08-02T05"
+
+
+@pytest.mark.asyncio
+async def test_each_damaged_hour_is_refused_once_not_once_per_frame(tmp_path: Path):
+    """Re-arming per hour must not become re-trying per frame: retrying puts one
+    ledger event and one decompress of the damaged hour behind every frame.
+    """
+    from capture.raw_writer import paths_for
+
+    venue = BinanceVenue()
+    t05 = 1785648600_000_000_000
+    first = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                          clock_ns=lambda: t05)
+    await first.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(2)]))
+    raw05, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw05)
+
+    hour_06 = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                            clock_ns=lambda: t05 + HOUR_NS)
+    await hour_06.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(2)]))
+    raw06, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T06")
+    _chop_last_byte(raw06)
+
+    # Ten frames into hour 05, ten into hour 06: two damaged hours, no more.
+    ticks = [t05] + [t05] * 10 + [t05 + HOUR_NS] * 10
+    both = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                         clock_ns=clock_from(ticks))
+    await both.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(20)]))
+
+    assert both.stats()["unwritable"] == 20
+    events = read_all(tmp_path, "binance", "2026-08-02")
+    refusals = [e for e in events if e.kind == "unwritable_stream"]
+    assert len(refusals) == 2, "one refusal per damaged hour, not per frame"
+    assert {e.detail["hour"] for e in refusals} == {"2026-08-02T05", "2026-08-02T06"}
+    totals = [e for e in events if e.kind == "unwritable_stream_total"]
+    assert {e.detail["hour"]: e.detail["frames_lost"] for e in totals} == {
+        "2026-08-02T05": 10, "2026-08-02T06": 10}
+
+
+@pytest.mark.asyncio
+async def test_closing_twice_does_not_double_count_a_quarantined_hour(tmp_path: Path):
+    """`consume` closes in a `finally` and callers close explicitly. The totals
+    dict has to be cleared as it is recorded, or the second close reports the
+    same lost frames again and the ledger overstates the incident.
+    """
+    from capture.raw_writer import paths_for
+
+    venue = BinanceVenue()
+    t05 = 1785648600_000_000_000
+    first = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                          clock_ns=lambda: t05)
+    await first.consume(_frames([_depth_frame("BTCUSDT", i) for i in range(2)]))
+    raw, _ = paths_for(tmp_path, "binance", "depth", "BTCUSDT", "2026-08-02T05")
+    _chop_last_byte(raw)
+
+    second = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                           clock_ns=lambda: t05)
+    await second.consume(_frames([_depth_frame("BTCUSDT", 1)]))
+    second.close()
+    second.close()
+
+    totals = [e for e in read_all(tmp_path, "binance", "2026-08-02")
+              if e.kind == "unwritable_stream_total"]
+    assert len(totals) == 1, f"{len(totals)} totals for one quarantined hour"
+    assert totals[0].detail["frames_lost"] == 1

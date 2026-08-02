@@ -9,6 +9,7 @@ import json
 import re
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -16,7 +17,7 @@ from capture.capture_ledger import (
     CaptureLedger, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO,
     SEVERITY_OBSERVATION_LOSS,
 )
-from capture.raw_writer import RawCaptureError, RawWriter
+from capture.raw_writer import RawCaptureError, RawWriter, hour_key
 from capture.sequencing import BinanceDepthTracker, StalenessTracker, quantile_ns
 
 # stream/symbol come from `extract()`, which reads them out of the wire
@@ -60,6 +61,21 @@ def _safe_path_token(value: str) -> str:
     return value if _SAFE_PATH_TOKEN.match(value) else "unknown"
 
 
+@dataclass
+class _QuarantinedHour:
+    """One (stream, symbol, hour) whose files cannot be written, and its cost.
+
+    Carries the display casing of the stream and symbol because the quarantine
+    is keyed on the casefolded form - the same key `_writers` uses, so a stream
+    reported with two casings cannot quarantine one and keep writing the other.
+    """
+
+    stream: str
+    symbol: str
+    hour: str
+    frames_lost: int = 0
+
+
 class VenueRecorder:
     """Routes one venue's frames to per-stream writers, the ledger and gap trackers.
 
@@ -94,9 +110,10 @@ class VenueRecorder:
         self._recorded_silent_streams: set[tuple[str, str]] = set()
         self._writers: dict[tuple[str, str], RawWriter] = {}
         self._trackers: dict[tuple[str, str], object] = {}
-        # Streams whose hour cannot be written, mapped to how many frames that
-        # has cost. See `_append_or_quarantine_stream`.
-        self._unwritable_streams: dict[tuple[str, str], int] = {}
+        # (stream, symbol, hour) triples whose files cannot be written, and what
+        # each has cost so far. Keyed by HOUR, not by stream: see
+        # `_append_or_quarantine_stream`.
+        self._unwritable_hours: dict[tuple[str, str, str], _QuarantinedHour] = {}
         self._stats = {"written": 0, "dropped": 0, "control": 0, "malformed": 0,
                        "unwritable": 0}
 
@@ -142,56 +159,98 @@ class VenueRecorder:
         permanent crash loop across every stream of the venue - strictly worse
         than the silent data loss the refusal replaced.
 
-        So the damage is contained to the stream that owns it. The stream is
-        quarantined on first failure rather than retried per frame: the condition
-        is persistent by construction, and retrying would put one ledger event
-        and one decompress of the damaged hour behind every frame that arrives.
+        So the damage is contained to the stream that owns it, FOR THE HOUR THAT
+        OWNS IT. The quarantine is keyed on (stream, symbol, hour) rather than on
+        the stream alone, because that is the scope of the condition: every
+        `RawCaptureError` names one hour's pair of files, and the next hour is a
+        different pair that has not been written yet. Keying it per stream made
+        one torn hour left behind by a prior crash cost that stream every
+        remaining hour of the run - on a 24/7 recorder, the stream itself.
 
-        Only `RawCaptureError` is isolated. It names damage to one hour's files,
-        which is inherently per-stream. Anything else - ENOSPC, a bad descriptor,
-        MemoryError - is a whole-recorder condition, and pretending it is
-        per-stream would spin instead of surfacing it.
+        Within an hour the refusal is not retried per frame. The condition IS
+        persistent at that scope - the damaged bytes do not heal while the
+        process runs - and retrying would put one ledger event and one decompress
+        of the damaged hour behind every frame that arrives. Across rotation it
+        is not persistent at all, which is what the previous version of this
+        docstring got wrong.
+
+        Only `RawCaptureError` is isolated. It names damage to, or contention
+        over, one hour's files, which is inherently per-hour. Anything else -
+        ENOSPC, a bad descriptor, MemoryError - is a whole-recorder condition,
+        and pretending it is per-stream would spin instead of surfacing it.
         """
         key = (stream.casefold(), symbol.casefold())
         # Liveness is recorded before anything can go wrong with the write: a
         # stream whose hour is quarantined is still speaking, and reporting it
         # dead as well would be false.
         self._note_stream_spoke(key, t_recv_ns)
-        if key in self._unwritable_streams:
-            self._unwritable_streams[key] += 1
+
+        hour = hour_key(t_recv_ns)
+        # This stream has moved on to another hour, so whatever it lost in the
+        # hours it left behind is final and can be reported now. Waiting for
+        # `close()` means an unattended run never reports the size of the loss.
+        self._record_unwritable_hour_totals(
+            [self._unwritable_hours.pop(k) for k in list(self._unwritable_hours)
+             if k[:2] == key and k[2] != hour],
+            ts_ns=t_recv_ns)
+
+        quarantine_key = key + (hour,)
+        quarantined = self._unwritable_hours.get(quarantine_key)
+        if quarantined is not None:
+            quarantined.frames_lost += 1
             self._stats["unwritable"] += 1
             return
         try:
             self._writer_for(stream, symbol).append(
                 payload, t_recv_ns, t_exch_ms, seq, kind=kind)
         except RawCaptureError as exc:
-            self._unwritable_streams[key] = 1
+            self._unwritable_hours[quarantine_key] = _QuarantinedHour(
+                stream=stream, symbol=symbol, hour=hour, frames_lost=1)
             self._stats["unwritable"] += 1
             self._ledger.record(LedgerEvent(
                 ts_ns=t_recv_ns, venue=self._venue.name, stream=stream,
                 kind="unwritable_stream", severity=SEVERITY_CORRUPTING,
-                detail={"symbol": symbol, "error": type(exc).__name__,
-                        "message": str(exc)},
+                detail={"symbol": symbol, "hour": hour,
+                        "error": type(exc).__name__, "message": str(exc)},
             ))
             return
         self._stats["written"] += 1
 
-    def _record_unwritable_stream_totals(self) -> None:
-        """Put each quarantined stream's frame count in the ledger, not just RAM.
+    def _record_unwritable_hour_totals(self, quarantined: list[_QuarantinedHour],
+                                       ts_ns: int) -> None:
+        """Put each quarantined hour's frame count in the ledger, not just RAM.
 
-        The per-stream counter dies with the process; the ledger is the record an
+        The in-memory counter dies with the process; the ledger is the record an
         incident is reconstructed from, so the size of the loss has to reach it.
 
-        Cleared as it is recorded, so a second `close()` - `consume` closes in a
-        `finally` and callers close explicitly - does not double-count.
+        The caller removes each record from `_unwritable_hours` before passing it
+        here, so nothing can be reported twice - `consume` closes in a `finally`
+        and callers close explicitly.
         """
-        recorded, self._unwritable_streams = self._unwritable_streams, {}
-        for (stream, symbol), lost in recorded.items():
+        for record in quarantined:
             self._ledger.record(LedgerEvent(
-                ts_ns=self._clock_ns(), venue=self._venue.name, stream=stream,
+                ts_ns=ts_ns, venue=self._venue.name, stream=record.stream,
                 kind="unwritable_stream_total", severity=SEVERITY_CORRUPTING,
-                detail={"symbol": symbol, "frames_lost": lost},
+                detail={"symbol": record.symbol, "hour": record.hour,
+                        "frames_lost": record.frames_lost},
             ))
+
+    def _record_unwritable_stream_totals(self) -> None:
+        """Report every hour still quarantined when the session ends.
+
+        Hours the recorder rotated past have already been reported from the
+        frame loop; what is left here is whatever was still quarantined at the
+        moment the session stopped.
+
+        Cleared as it is recorded, so a second `close()` does not double-count.
+        """
+        if not self._unwritable_hours:
+            # Deliberately does not read the clock: `close()` is the only caller
+            # and every clock read there is one a test has to supply.
+            return
+        recorded, self._unwritable_hours = self._unwritable_hours, {}
+        self._record_unwritable_hour_totals(list(recorded.values()),
+                                            ts_ns=self._clock_ns())
 
     def _note_stream_spoke(self, key: tuple[str, str], t_recv_ns: int) -> None:
         """Remember that this stream is alive, and how far apart its frames come.
