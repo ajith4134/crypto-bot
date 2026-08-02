@@ -6,11 +6,22 @@ from capture.venues import ExtractedMeta, StreamSpec
 _WS_BASE = "wss://fstream.binance.com/stream?streams="
 _INSTRUMENTS_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-_CORE_CHANNELS = ["depth@100ms", "aggTrade", "markPrice@1s", "forceOrder"]
-_TAIL_CHANNELS = ["aggTrade", "markPrice@1s", "forceOrder"]
+# `trade` rather than `aggTrade`, decided 2026-08-02 from live measurement:
+# aggTrade delivers nothing at all to this host over the websocket (0 frames in
+# 25s while depth and bookTicker flow normally, and REST /fapi/v1/aggTrades
+# returns data - so the venue has it and a subset of websocket streams is
+# silent). `trade` works, and it carries individual trades rather than
+# aggregated ones, which is strictly more raw and the better fit for this layer.
+_CORE_CHANNELS = ["depth@100ms", "trade", "markPrice@1s", "forceOrder"]
+_TAIL_CHANNELS = ["trade", "markPrice@1s", "forceOrder"]
 
+# The stream name each event routes to. It must equal the `stream` on the
+# StreamSpec that subscribed to it (`channel.split("@")[0]`), or one logical
+# stream splits across two filenames. `aggTrade` stays mapped even though
+# nothing subscribes to it now, so an archive captured earlier still routes.
 _EVENT_TO_STREAM = {
     "depthUpdate": "depth",
+    "trade": "trade",
     "aggTrade": "aggTrade",
     "markPriceUpdate": "markPrice",
     "forceOrder": "forceOrder",

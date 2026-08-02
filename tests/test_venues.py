@@ -1,5 +1,15 @@
+import json
+
 from capture.venues.binance import BinanceVenue
 from capture.venues.hyperliquid import HyperliquidVenue
+
+# Captured verbatim from wss://fstream.binance.com/stream?streams=btcusdt@trade
+# on 2026-08-02T11:51Z. Not invented: the shape of a real frame is the thing
+# under test, and `st` for one is undocumented.
+REAL_BINANCE_TRADE_FRAME = json.loads(
+    '{"stream":"btcusdt@trade","data":{"e":"trade","E":1785671500407,'
+    '"T":1785671500407,"s":"BTCUSDT","t":7947131392,"p":"63105.80",'
+    '"q":"0.030","X":"MARKET","m":true,"st":1}}')
 
 
 def test_binance_builds_combined_stream_url():
@@ -8,7 +18,35 @@ def test_binance_builds_combined_stream_url():
     url = v.ws_url(specs)
     assert url.startswith("wss://fstream.binance.com/stream?streams=")
     assert "btcusdt@depth@100ms" in url
-    assert "btcusdt@aggTrade" in url
+    assert "btcusdt@trade" in url
+
+
+def test_binance_captures_individual_trades_not_aggregated_ones():
+    """aggTrade delivers nothing over the websocket (measured 2026-08-02) and
+    aggregated trades are less raw than individual ones either way."""
+    v = BinanceVenue()
+    core = {spec.channel for spec in v.core_specs(["BTCUSDT"])}
+    tail = {spec.channel for spec in v.tail_specs(["BTCUSDT"])}
+    assert "btcusdt@trade" in core and "btcusdt@trade" in tail
+    assert not any("aggTrade" in channel for channel in core | tail)
+
+
+def test_binance_trade_frame_routes_to_the_stream_its_spec_named():
+    """`StreamSpec.stream` and `ExtractedMeta.stream` have to agree. If they
+    drift, one logical stream is written under two filenames and neither holds
+    the whole record."""
+    v = BinanceVenue()
+    spec = next(s for s in v.core_specs(["BTCUSDT"]) if s.channel == "btcusdt@trade")
+    meta = v.extract(REAL_BINANCE_TRADE_FRAME)
+
+    assert meta.stream == spec.stream == "trade"
+    assert meta.symbol == spec.symbol == "BTCUSDT"
+    assert meta.kind == "data"
+    assert meta.t_exch_ms == 1785671500407
+    # A trade carries a trade id (`t`) but no U/u/pu chain to reconcile against,
+    # so there is no sequence to record. The id is in the payload verbatim for
+    # anyone who later wants to check trade-id continuity.
+    assert meta.seq is None
 
 
 def test_binance_extract_reads_both_timestamps_and_chain():

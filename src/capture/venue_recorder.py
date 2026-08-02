@@ -13,6 +13,7 @@ from typing import AsyncIterator, Callable
 
 from capture.capture_ledger import (
     CaptureLedger, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO,
+    SEVERITY_OBSERVATION_LOSS,
 )
 from capture.raw_writer import RawCaptureError, RawWriter
 from capture.sequencing import BinanceDepthTracker, HyperliquidStalenessTracker
@@ -39,13 +40,23 @@ class VenueRecorder:
     """
 
     def __init__(self, venue, specs, root: Path, queue_size: int = 10_000,
-                 clock_ns: Callable[[], int] = time.time_ns) -> None:
+                 clock_ns: Callable[[], int] = time.time_ns,
+                 silence_grace_seconds: float = 60.0) -> None:
         self._venue = venue
         self._specs = specs
         self._root = Path(root)
         self._queue_size = queue_size
         self._clock_ns = clock_ns
         self._ledger = CaptureLedger(root, venue.name)
+        # Subscribed streams, keyed the way writers are keyed, so "did this one
+        # ever speak?" is a lookup in `_writers`. See `_record_silent_streams`.
+        self._expected_streams = {
+            (spec.stream.casefold(), spec.symbol.casefold()): (spec.stream, spec.symbol)
+            for spec in specs
+        }
+        self._session_start_ns = clock_ns()
+        self._silence_grace_ns = int(silence_grace_seconds * 1e9)
+        self._silent_streams_recorded = False
         self._writers: dict[tuple[str, str], RawWriter] = {}
         self._trackers: dict[tuple[str, str], object] = {}
         # Streams whose hour cannot be written, mapped to how many frames that
@@ -135,6 +146,45 @@ class VenueRecorder:
                 detail={"symbol": symbol, "frames_lost": lost},
             ))
 
+    def _record_silent_streams(self, now_ns: int) -> None:
+        """Record every subscribed stream that has not produced a single frame.
+
+        A stream that was asked for and never answered is invisible: no file is
+        created, so it looks exactly like a healthy stream in a quiet market -
+        an empty directory nobody notices. This is not hypothetical. Measured
+        against Binance on 2026-08-02, `aggTrade`, `markPrice@1s` and
+        `forceOrder` delivered zero frames over the websocket while `depth`
+        flowed normally, and nothing in the capture said so.
+
+        The claim made here is narrow and exact: *nothing arrived on this stream
+        in the first `silence_grace_seconds` of the session*. Every stream is
+        silent at startup, so the grace period is what stops this firing on
+        every start. A stream that spoke and then stopped is a different
+        condition with a different owner - the staleness and gap trackers.
+
+        Recorded at most once per session: `consume` keeps calling this as
+        frames arrive and `close` calls it again, and an event per frame would
+        drown the ledger in the anomaly it exists to surface.
+
+        Severity is observation loss, not corruption: what was captured is
+        intact, there is simply less of it than was asked for.
+        """
+        if self._silent_streams_recorded:
+            return
+        if now_ns - self._session_start_ns < self._silence_grace_ns:
+            return
+        self._silent_streams_recorded = True
+        for key, (stream, symbol) in self._expected_streams.items():
+            if key in self._writers:
+                continue
+            self._ledger.record(LedgerEvent(
+                ts_ns=now_ns, venue=self._venue.name, stream=stream,
+                kind="silent_stream", severity=SEVERITY_OBSERVATION_LOSS,
+                detail={"symbol": symbol, "frames_received": 0,
+                        "silent_for_seconds": round(
+                            (now_ns - self._session_start_ns) / 1e9, 3)},
+            ))
+
     def _record_gap(self, stream: str, symbol: str, report, t_recv_ns: int) -> None:
         self._ledger.record(LedgerEvent(
             ts_ns=t_recv_ns, venue=self._venue.name, stream=stream,
@@ -154,37 +204,48 @@ class VenueRecorder:
                 try:
                     parsed = json.loads(payload)
                 except json.JSONDecodeError:
-                    self._stats["malformed"] += 1
-                    self._ledger.record(LedgerEvent(
-                        ts_ns=t_recv_ns, venue=self._venue.name, stream="unknown",
-                        kind="malformed", severity=SEVERITY_INFO,
-                        detail={"bytes": len(payload)},
-                    ))
-                    self._append_or_quarantine_stream(
-                        "unknown", "unknown", payload, t_recv_ns, None, None,
-                        kind="malformed")
-                    continue
-
-                meta = self._venue.extract(parsed)
-                if meta.kind == "control":
-                    self._stats["control"] += 1
-
-                stream = _safe_path_token(meta.stream)
-                symbol = _safe_path_token(meta.symbol)
-
-                tracker = self._tracker_for(stream, symbol)
-                if tracker is not None and meta.kind == "data":
-                    body = parsed.get("data", parsed)
-                    report = (tracker.check(body) if isinstance(tracker, BinanceDepthTracker)
-                              else tracker.check(t_recv_ns))
-                    if report is not None:
-                        self._record_gap(stream, symbol, report, t_recv_ns)
-
-                self._append_or_quarantine_stream(
-                    stream, symbol, payload, t_recv_ns, meta.t_exch_ms, meta.seq,
-                    kind=meta.kind)
+                    self._record_malformed_frame(payload, t_recv_ns)
+                else:
+                    self._route_frame(parsed, payload, t_recv_ns)
+                # After the frame is routed, never before: a stream whose first
+                # frame is this one has already been counted as having spoken,
+                # so it cannot be reported silent in the same breath.
+                self._record_silent_streams(t_recv_ns)
         finally:
             self.close()
+
+    def _record_malformed_frame(self, payload: str, t_recv_ns: int) -> None:
+        """Flag a frame that is not JSON - and store it verbatim anyway."""
+        self._stats["malformed"] += 1
+        self._ledger.record(LedgerEvent(
+            ts_ns=t_recv_ns, venue=self._venue.name, stream="unknown",
+            kind="malformed", severity=SEVERITY_INFO,
+            detail={"bytes": len(payload)},
+        ))
+        self._append_or_quarantine_stream(
+            "unknown", "unknown", payload, t_recv_ns, None, None,
+            kind="malformed")
+
+    def _route_frame(self, parsed, payload: str, t_recv_ns: int) -> None:
+        """Send one parsed frame to its writer, tracker and - on a gap - the ledger."""
+        meta = self._venue.extract(parsed)
+        if meta.kind == "control":
+            self._stats["control"] += 1
+
+        stream = _safe_path_token(meta.stream)
+        symbol = _safe_path_token(meta.symbol)
+
+        tracker = self._tracker_for(stream, symbol)
+        if tracker is not None and meta.kind == "data":
+            body = parsed.get("data", parsed)
+            report = (tracker.check(body) if isinstance(tracker, BinanceDepthTracker)
+                      else tracker.check(t_recv_ns))
+            if report is not None:
+                self._record_gap(stream, symbol, report, t_recv_ns)
+
+        self._append_or_quarantine_stream(
+            stream, symbol, payload, t_recv_ns, meta.t_exch_ms, meta.seq,
+            kind=meta.kind)
 
     def stats(self) -> dict:
         # `dropped` stays at 0 forever in this task: nothing here has anywhere to
@@ -209,6 +270,13 @@ class VenueRecorder:
         # failure to record the totals must not cost the closes below.
         try:
             self._record_unwritable_stream_totals()
+        except Exception as exc:
+            errors.append(exc)
+        # A venue that sent nothing at all never entered the frame loop, so this
+        # is the only place that condition can be caught - and it is the worst
+        # one, because it leaves no file anywhere to notice the absence of.
+        try:
+            self._record_silent_streams(self._clock_ns())
         except Exception as exc:
             errors.append(exc)
         for writer in self._writers.values():

@@ -5,7 +5,10 @@ import pytest
 
 from capture.venue_recorder import VenueRecorder
 from capture.venues.binance import BinanceVenue
-from capture.capture_ledger import read_all, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO
+from capture.capture_ledger import (
+    read_all, LedgerEvent, SEVERITY_CORRUPTING, SEVERITY_INFO,
+    SEVERITY_OBSERVATION_LOSS,
+)
 
 
 async def _frames(items):
@@ -303,3 +306,125 @@ async def test_a_non_capture_error_still_unwinds_the_loop(tmp_path: Path):
 
     with pytest.raises(OSError, match="disk full"):
         await rec.consume(_frames([_depth_frame("BTCUSDT", 1)]))
+
+
+# --------------------------------------------------------------------------
+# subscribed but silent
+# --------------------------------------------------------------------------
+
+def clock_advancing_by(start_ns: int, step_ns: int):
+    """A clock that moves on every read, so a session can outrun a grace period
+    without the test waiting out real time."""
+    state = {"now": start_ns}
+
+    def clock_ns() -> int:
+        now = state["now"]
+        state["now"] = now + step_ns
+        return now
+
+    return clock_ns
+
+
+def silent_stream_events(root: Path) -> list:
+    return [e for e in read_all(root, "binance", "2026-08-02")
+            if e.kind == "silent_stream"]
+
+
+@pytest.mark.asyncio
+async def test_a_subscribed_stream_that_never_speaks_reaches_the_ledger(tmp_path: Path):
+    """A stream we asked for and never heard from looks exactly like a healthy
+    stream in a quiet market - an empty directory nobody notices. Measured
+    2026-08-02: Binance delivered depth and nothing else, and only the frames
+    that did arrive left any trace at all."""
+    venue = BinanceVenue()
+    specs = venue.core_specs(["BTCUSDT"])      # depth, trade, markPrice, forceOrder
+    rec = VenueRecorder(venue, specs, tmp_path, silence_grace_seconds=60,
+                        clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                    40_000_000_000))
+
+    await rec.consume(_frames([
+        json.dumps({"data": {"e": "depthUpdate", "E": 1, "s": "BTCUSDT",
+                             "U": 1, "u": 10, "pu": 0}}),
+        json.dumps({"data": {"e": "depthUpdate", "E": 2, "s": "BTCUSDT",
+                             "U": 11, "u": 20, "pu": 10}}),
+    ]))
+
+    events = silent_stream_events(tmp_path)
+    assert {e.stream for e in events} == {"trade", "markPrice", "forceOrder"}
+    assert all(e.severity == SEVERITY_OBSERVATION_LOSS for e in events)
+    assert all(e.detail["symbol"] == "BTCUSDT" for e in events)
+    assert all(e.detail["frames_received"] == 0 for e in events)
+
+
+@pytest.mark.asyncio
+async def test_a_stream_is_not_called_silent_during_the_startup_grace(tmp_path: Path):
+    """Every stream is silent for the first moments of a session. Flagging that
+    would put an event in the ledger on every single start."""
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                    1_000_000_000))
+
+    await rec.consume(_frames([_depth_frame("BTCUSDT", 1)]))
+
+    assert silent_stream_events(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_a_venue_that_sends_nothing_at_all_is_still_recorded(tmp_path: Path):
+    """The frame loop cannot notice this one: it never runs. Without a check on
+    the way out, a session that captured absolutely nothing leaves an empty
+    ledger - indistinguishable from a session that captured everything."""
+    venue = BinanceVenue()
+    # One tick at construction, one when close() looks at the time: the second
+    # read has to be past the grace period for the check to have anything to say.
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                    70_000_000_000))
+
+    await rec.consume(_frames([]))
+
+    assert {e.stream for e in silent_stream_events(tmp_path)} == {
+        "depth", "trade", "markPrice", "forceOrder"}
+
+
+@pytest.mark.asyncio
+async def test_silence_is_recorded_once_not_on_every_frame(tmp_path: Path):
+    """`consume` closes in a finally and callers close explicitly, and frames
+    keep arriving after the grace expires. One event per stream per session, or
+    the ledger drowns in the anomaly it is meant to surface."""
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                    40_000_000_000))
+
+    await rec.consume(_frames([_depth_frame("BTCUSDT", n) for n in range(1, 6)]))
+    rec.close()
+
+    assert len(silent_stream_events(tmp_path)) == 3
+
+
+@pytest.mark.asyncio
+async def test_silence_is_reported_during_the_run_not_only_at_shutdown(tmp_path: Path):
+    """A `--seconds 0` capture runs for days. Learning at shutdown that a stream
+    never spoke is learning far too late, so the check runs as frames arrive and
+    the ledger is written before the session ends."""
+    venue = BinanceVenue()
+    rec = VenueRecorder(venue, venue.core_specs(["BTCUSDT"]), tmp_path,
+                        silence_grace_seconds=60,
+                        clock_ns=clock_advancing_by(1785648600_000_000_000,
+                                                    40_000_000_000))
+    recorded_mid_run = []
+
+    async def frames_and_a_look_at_the_ledger():
+        yield _depth_frame("BTCUSDT", 1)          # t0 + 40s: inside the grace
+        yield _depth_frame("BTCUSDT", 2)          # t0 + 80s: grace has passed
+        recorded_mid_run.extend(silent_stream_events(tmp_path))
+        yield _depth_frame("BTCUSDT", 3)
+
+    await rec.consume(frames_and_a_look_at_the_ledger())
+
+    assert {e.stream for e in recorded_mid_run} == {"trade", "markPrice", "forceOrder"}
