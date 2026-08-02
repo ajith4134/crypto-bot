@@ -161,7 +161,7 @@ ledger event; raw bytes stay untouched even when malformed.
 |---|---|
 | Websocket disconnect | Exponential backoff. Ledger event with disconnect + reconnect times. Binance depth: mark book invalid, REST snapshot resync, record the resync |
 | Sequence-chain break | Ledger event, **severity=corrupting**, resync. Downstream must be able to exclude the window |
-| Hyperliquid staleness | Time-based only: no frame in N× expected interval → **severity=observation-loss** |
+| Hyperliquid staleness | Time-based only. Per-stream expected interval is measured over a rolling window; **staleness fires at 10× the rolling median inter-frame gap, floored at 5 s** → **severity=observation-loss**. Both values are tunable per stream, not hardcoded constants |
 | Writer queue overflow | Ledger event, **loud alert**. The only path to true data loss |
 | Disk pressure | Degradation ladder — see below |
 | GCS upload failure | Retry with backoff. **Never prune on a timer — only after checksum-verified upload.** Alert on backlog growth |
@@ -257,6 +257,23 @@ bucket name available, and creating a bucket is an outward billable action not t
 **Gating rule:** the recorder ships and runs **local-only from day one** — capture starts
 immediately, nothing irreplaceable is lost — and offload is switched on the moment the write test
 passes. No code depends on GCS until proven.
+
+#### Local-only mode semantics — resolves an otherwise fatal contradiction
+
+§7.1 forbids pruning any file whose upload is not checksum-verified. In local-only mode **nothing is
+ever uploaded, therefore nothing may ever be pruned.** Without an explicit rule the disk simply
+fills. The rule:
+
+- **Local-only mode never prunes and never deletes.** Retention is not enforced; the archive grows
+  monotonically at ~1–2 GB/day.
+- **The disk degradation ladder (§6) is the only defence**, and it protects capture, not the disk.
+- `capture_health` escalates on **free-space runway**, not percentage: warn at **30 days**
+  remaining, alert daily at **14 days**, and at **7 days** raise a **hard decision point** —
+  by then either offload works, or a human must consciously choose what to stop capturing.
+  Runway is computed from measured 7-day average daily bytes, not a fixed threshold.
+- **B1 therefore carries a deadline, not just a blocker.** At ~1–2 GB/day against 91 GB free, the
+  hard decision point arrives in roughly **6–12 weeks** from first capture. Resolving GCS access is
+  not urgent on day one; it is unambiguously urgent before then.
 
 ### B2 — Reboot persistence unresolved (non-blocking, needs mitigation)
 
