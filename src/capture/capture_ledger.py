@@ -47,7 +47,7 @@ class CaptureLedger:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._fh = open(path, "a", encoding="utf-8")
             self._date = date
-        self._fh.write(json.dumps(asdict(event), separators=(",", ":"), sort_keys=True) + "\n")
+        self._fh.write(json.dumps(asdict(event), separators=(",", ":"), sort_keys=True, default=str) + "\n")
         self._fh.flush()
 
     def close(self) -> None:
