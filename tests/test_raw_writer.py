@@ -57,3 +57,30 @@ def test_rotation_creates_new_hour_file(tmp_path: Path):
     assert read_pair(r6, i6)[0][0] == '{"h":6}'
     # n resets per file
     assert read_pair(r6, i6)[0][1].n == 0
+
+
+def test_payload_with_backslash_roundtrips_exactly(tmp_path: Path):
+    """Regression test for finding 1: backslash should not be corrupted."""
+    payload = '{"path":"C:\\\\Users\\\\data"}'
+    w = RawWriter(tmp_path, "test", "trades", "SYMBOL")
+    w.append(payload, t_recv_ns=1785648600_000_000_000, t_exch_ms=None, seq=None)
+    w.close()
+
+    raw, idx = paths_for(tmp_path, "test", "trades", "SYMBOL", "2026-08-02T05")
+    pairs = read_pair(raw, idx)
+    assert pairs[0][0] == payload  # byte-exact, with all backslashes intact
+    assert pairs[0][1].esc is False
+
+
+def test_payload_with_u2028_roundtrips_exactly(tmp_path: Path):
+    """Regression test for finding 2: U+2028 should not cause over-split."""
+    payload = '{"text":"before\u2028after"}'  # U+2028 line separator
+    w = RawWriter(tmp_path, "test", "trades", "SYMBOL")
+    w.append(payload, t_recv_ns=1785648600_000_000_000, t_exch_ms=None, seq=None)
+    w.close()
+
+    raw, idx = paths_for(tmp_path, "test", "trades", "SYMBOL", "2026-08-02T05")
+    pairs = read_pair(raw, idx)
+    assert len(pairs) == 1  # Should not split on U+2028
+    assert pairs[0][0] == payload  # byte-exact roundtrip
+    assert pairs[0][1].esc is False
